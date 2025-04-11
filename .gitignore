@@ -1,0 +1,29 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment variables
+.env
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# IDE specific files
+.vscode/
+.idea/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
+# Output directories (optional, depends on usage)
+output/
+quantized_models/
+
+# OS specific
+.DS_Store
+Thumbs.db
