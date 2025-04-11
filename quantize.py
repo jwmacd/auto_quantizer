@@ -12,6 +12,16 @@ import logging
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Define a default quantization configuration
+DEFAULT_QUANT_CONFIG = {
+    "w_bit": 4,
+    "q_group_size": 128,
+    "zero_point": True,
+    "version": "GEMM"
+}
+
+DEFAULT_QUANT_CONFIG_STR = json.dumps(DEFAULT_QUANT_CONFIG)
+
 def main():
     """
     Main function to parse arguments, load model/tokenizer, perform AWQ quantization,
@@ -19,10 +29,12 @@ def main():
     alongside the original model files.
     """
     parser = argparse.ArgumentParser(description="Quantize a model using AutoAWQ and save results in the model directory.")
-    parser.add_argument('--model_path', type=str, required=True,
+    parser.add_argument('--model_path', type=str, required=False,
+                        default='/models',
                         help='Path to the directory containing the pre-trained model and tokenizer (e.g., HF model format). Output files will also be saved here.')
     # Correctly escape the inner JSON example within the help string for the JSON parser
-    parser.add_argument('--quant_config', type=str, required=True,
+    parser.add_argument('--quant_config', type=str, required=False,
+                        default=DEFAULT_QUANT_CONFIG_STR,
                         help='JSON string with quantization configuration (e.g., \'{"w_bit": 4, "q_group_size": 128, "zero_point": true, "version": "GEMM"}\')')
 
     args = parser.parse_args()
