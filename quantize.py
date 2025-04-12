@@ -106,7 +106,7 @@ def main():
         # and mapping to device.
         model = AutoAWQForCausalLM.from_pretrained(
             args.model_path,
-            max_memory=max_memory_map, # Provide memory hints for distribution
+            # max_memory=max_memory_map, # Removed to test device placement issue
             device_map="auto", # Let Hugging Face Accelerate handle device mapping
             trust_remote_code=True,
             safetensors=True, # Prefer safetensors loading if available
