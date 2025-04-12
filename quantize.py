@@ -98,9 +98,9 @@ def main():
         # Dynamically create max_memory map for available GPUs inside the container
         num_gpus = torch.cuda.device_count()
         logging.info(f"Detected {num_gpus} CUDA devices available inside the container.")
-        # Assign 21GiB to each detected GPU. Indices inside container are 0, 1, ... num_gpus-1
+        # Assign 23GiB to each detected GPU. Indices inside container are 0, 1, ... num_gpus-1
         # These will map to the host GPUs specified in the docker run --gpus flag.
-        max_memory_map = {i: "21GiB" for i in range(num_gpus)}
+        max_memory_map = {i: "23GiB" for i in range(num_gpus)}
         logging.info(f"Generated max_memory map: {max_memory_map}")
 
     # --- Load Model and Tokenizer ---
