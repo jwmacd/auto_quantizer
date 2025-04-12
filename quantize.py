@@ -93,6 +93,15 @@ def main():
     logging.info(f"Using device: {device}")
     if device == "cpu":
         logging.warning("Running on CPU. Quantization may be very slow and might not be fully supported by all AWQ features.")
+        max_memory_map = None # No memory map needed for CPU
+    else:
+        # Dynamically create max_memory map for available GPUs inside the container
+        num_gpus = torch.cuda.device_count()
+        logging.info(f"Detected {num_gpus} CUDA devices available inside the container.")
+        # Assign 21GiB to each detected GPU. Indices inside container are 0, 1, ... num_gpus-1
+        # These will map to the host GPUs specified in the docker run --gpus flag.
+        max_memory_map = {i: "21GiB" for i in range(num_gpus)}
+        logging.info(f"Generated max_memory map: {max_memory_map}")
 
     # --- Load Model and Tokenizer ---
     logging.info(f"Loading model and tokenizer from: {args.model_path}")
@@ -106,7 +115,7 @@ def main():
         # and mapping to device.
         model = AutoAWQForCausalLM.from_pretrained(
             args.model_path,
-            # max_memory=max_memory_map, # Removed to test device placement issue
+            max_memory=max_memory_map, # Reintroduced dynamic max_memory map
             device_map="auto", # Let Hugging Face Accelerate handle device mapping
             trust_remote_code=True,
             safetensors=True, # Prefer safetensors loading if available
