@@ -14,7 +14,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && \
         git+https://github.com/casper-hansen/AutoAWQ.git \
         transformers~=4.45.0 \
         accelerate~=0.30.0 \
-        safetensors && \
+        safetensors \
+        huggingface_hub[hf_xet] && \
     apt-get purge -y --auto-remove git && \
     rm -rf /var/lib/apt/lists/*
 

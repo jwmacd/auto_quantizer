@@ -162,7 +162,7 @@ def main():
         logging.info(f"Saving AWQ quantized model temporarily before moving to: {args.model_path}")
         logging.info(f"Using temporary directory: {temp_dir}")
         try:
-            model.save_quantized(temp_dir, shard_size="10GB") # Increase shard size maybe? CPU might handle larger files better
+            model.save_quantized(temp_dir, shard_size="4GB") # Limit to 4GB for Hugging Face compatibility
             logging.info(f"AWQ quantized model temporarily saved to {temp_dir}")
 
             # Files to copy: *.safetensors, quant_config.json, AND model.safetensors.index.json
@@ -262,7 +262,7 @@ def main():
         logging.info(f"Saving GPTQ quantized model temporarily to: {temp_dir}")
         try:
             # save_pretrained will save the model shards, config with quant info, tokenizer etc.
-            model.save_pretrained(temp_dir)
+            model.save_pretrained(temp_dir, max_shard_size="4GB") # Limit to 4GB for Hugging Face compatibility
             tokenizer.save_pretrained(temp_dir) 
             logging.info(f"GPTQ quantized model and tokenizer temporarily saved to {temp_dir}")
 

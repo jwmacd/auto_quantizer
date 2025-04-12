@@ -122,7 +122,7 @@ The GPTQ quantization also preserves all original files and adds:
 
 ## Resource Requirements
 
-* **Memory:** AWQ typically requires 1.5-2x the original model size temporarily
+* **Memory:** Typically significantly less than the original model size
 * **Disk:** Need space for original model + quantized output
 * **Time:** Expect several hours for quantization on CPU depending on model size
 
