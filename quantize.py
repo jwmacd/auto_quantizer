@@ -22,6 +22,17 @@ DEFAULT_QUANT_CONFIG = {
 
 DEFAULT_QUANT_CONFIG_STR = json.dumps(DEFAULT_QUANT_CONFIG)
 
+# Define approximate max memory per GPU (leaving some headroom)
+# Assumes 5 GPUs are passed through (e.g., 4x 4090, 1x 3090)
+# Adjust indices and values if your system maps GPUs differently or has different limits
+max_memory_map = {
+    0: "21GiB",  # GPU 0 (RTX 4090)
+    1: "21GiB",  # GPU 1 (RTX 4090)
+    2: "21GiB",  # GPU 2 (RTX 3090)
+    3: "21GiB",  # GPU 3 (RTX 4090)
+    4: "21GiB"   # GPU 4 (RTX 4090)
+}
+
 def main():
     """
     Main function to parse arguments, load model/tokenizer, perform AWQ quantization,
@@ -95,9 +106,10 @@ def main():
         # and mapping to device.
         model = AutoAWQForCausalLM.from_pretrained(
             args.model_path,
+            max_memory=max_memory_map, # Provide memory hints for distribution
+            device_map="auto", # Let Hugging Face Accelerate handle device mapping
             trust_remote_code=True,
             safetensors=True, # Prefer safetensors loading if available
-            device_map="auto" # Let Hugging Face Accelerate handle device mapping
         )
         logging.info("Pre-trained model loaded successfully.")
 
