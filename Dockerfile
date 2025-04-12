@@ -18,6 +18,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && \
     apt-get purge -y --auto-remove git && \
     rm -rf /var/lib/apt/lists/*
 
+COPY requirements.txt /app/
+
+# Install Python dependencies
+# Use --no-cache-dir to reduce image size
+RUN pip install --no-cache-dir -r /app/requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
+
 # Copy the quantization script into the container
 COPY quantize.py /app/
 

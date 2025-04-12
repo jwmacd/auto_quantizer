@@ -1,104 +1,103 @@
-# Docker Container for AutoAWQ Quantization
+# Model Quantizer Docker Container
 
-This project provides a Docker container to quantize Hugging Face compatible language models using the [AutoAWQ](https://github.com/casper-hansen/AutoAWQ) library. It simplifies the process of applying Activation-aware Weight Quantization (AWQ) to models, creating a smaller and potentially faster version suitable for inference.
-
-## Features
-
-- Quantizes models compatible with the Hugging Face `transformers` library.
-- Uses the `AutoAWQ` library for efficient quantization.
-- Saves quantized models alongside original files with an `-AWQ` suffix.
-- Dockerized for easy environment setup and reproducibility.
-- Supports GPU acceleration via NVIDIA Container Toolkit.
+This repository contains the necessary files to build a Docker container capable of quantizing large language models using AWQ (Activation-aware Weight Quantization) or GPTQ methods **on the CPU**.
 
 ## Prerequisites
 
-- Docker installed ([Docker Engine](https://docs.docker.com/engine/install/))
-- NVIDIA Container Toolkit installed if using GPU acceleration ([Installation Guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html))
-- A Hugging Face compatible language model directory containing model weights (e.g., `.safetensors` files) and tokenizer files.
+*   Docker installed on your system.
+*   NVIDIA Container Toolkit installed (if using GPU for GPTQ).
+*   Sufficient disk space for the Docker image and models.
+*   A pre-trained model in Hugging Face format (containing configuration files like `config.json`, tokenizer files, and model weights, preferably in `safetensors` format).
 
 ## Building the Docker Image
 
-Build the image using the provided `Dockerfile`. You can tag it with a name of your choice.
+1.  Clone this repository:
 
-```bash
-docker build -t <image-name> . 
+    ```bash
+git clone <repository_url>
+cd <repository_directory>
 ```
 
-## Running Quantization
+2.  Build the Docker image:
 
-To run the quantization, mount the directory containing your model files with **Read/Write access** into the container at `/models`. The script reads the model from `/models` and saves the quantized output files (`*-AWQ.safetensors`, `quant_config-AWQ.json`) back into the same directory on your host.
-
-```bash
-# Example using GPU acceleration
-# Ensure the host path /path/to/your/models is writable
-docker run --rm --gpus all \
-  -v /path/to/your/models:/models:rw \
-  <image-name> \
-  --model_path /models \
-  --quant_config '{"zero_point": true, "q_group_size": 128, "w_bit": 4, "version": "GEMM"}'
+    ```bash
+docker build -t quantizer .
 ```
 
-**Arguments:**
-  - `--gpus all`: (Optional) Enables GPU acceleration. Remove this flag to run on CPU only.
-  - `-v /path/to/your/models:/models:rw`: Mounts your local model directory (replace `/path/to/your/models`) to `/models` inside the container with Read/Write permissions.
-  - `<image-name>`: The name you tagged the Docker image with during the build step.
-  - `--model_path /models`: Specifies the path *inside the container* where the model is located and where output AWQ files will be saved.
-  - `--quant_config '...'`: A JSON string specifying the AWQ quantization parameters. Common parameters include:
-    - `w_bit`: Number of bits for weight quantization (e.g., 4).
-    - `q_group_size`: Group size for quantization (e.g., 128).
-    - `zero_point`: Whether to use zero-point quantization (e.g., `true`).
-    - `version`: AWQ implementation version (e.g., `GEMM`, `W4A16`). Refer to AutoAWQ documentation for options.
+## Running the Quantization Script
 
-**Output:**
+The `quantize.py` script inside the container performs the quantization. You need to mount the directory containing your model into the container (e.g., to `/models`) and potentially specify other parameters.
 
-The script will create `*-AWQ.safetensors` and `quant_config-AWQ.json` files within the directory you mounted (e.g., `/path/to/your/models` on your host).
+### Command-Line Arguments for `quantize.py`
 
-## Optional: Deployment via Container Registry (e.g., GHCR)
+*   `--model_path`: (Optional) Path *inside the container* to the model directory. Default: `/models`.
+*   `--awq`: (Flag) Use AWQ quantization (4-bit). This is the default if neither `--awq` nor `--gptq` is specified.
+*   `--gptq`: (Flag) Use GPTQ quantization (8-bit). **Warning:** This is extremely slow on the CPU.
+*   `--bits`: (Optional) Number of bits for quantization. Default: 4 for `awq`, 8 for `gptq`. Currently, only these defaults are fully supported by the script's logic.
+*   `--quant_config`: (Optional) JSON string for custom quantization config, merging with method defaults (e.g., `'{"q_group_size": 64}'`).
+*   `--gptq_dataset`: (Optional, for GPTQ only) Dataset name from Hugging Face Datasets for GPTQ calibration. Default: `wikitext2`.
+*   `--gptq_group_size`: (Optional, for GPTQ only) Group size for GPTQ quantization. Default: 128.
+*   `--gptq_desc_act`: (Optional, flag, for GPTQ only) Use descending activation order for GPTQ. Default: False.
 
-If you want to store your built image in a container registry like GitHub Container Registry (GHCR) for easier distribution or use on other machines (like an Unraid server), follow these steps:
+### Example Docker Run Commands
 
-1. **Build the Image Locally** (if not already done):
+Replace `/path/to/your/host/models/YourModelName` with the actual path to your model directory on the host machine.
 
-    ```bash
-    docker build -t <image-name> . 
-    ```
+#### 1. AWQ Quantization (4-bit, CPU - Default)
 
-2. **Tag for the Registry:**
-    Tag the image with the full registry path, including your registry username/organization and a chosen image name/tag. Replace placeholders accordingly.
+This uses the default setting (`--awq` is implied if neither flag is present).
 
-    ```bash
-    # Example for GHCR:
-    # docker tag <local-image-name> <registry-host>/<your-ghcr-username>/<image-name>:<tag>
-    docker tag <image-name> ghcr.io/<your-ghcr-username>/<image-name>:<tag>
-    ```
+```bash
+docker run --rm -it \
+  -v /path/to/your/host/models/YourModelName:/models:rw \
+  quantizer
+```
 
-3. **Log in to the Registry:**
-    Authenticate with the container registry. For GHCR, use your GitHub username and a Personal Access Token (PAT) with appropriate `read:packages` and `write:packages` scopes.
+Or explicitly with the flag:
 
-    ```bash
-    # Example for GHCR:
-    docker login ghcr.io -u <your-ghcr-username>
-    ```
-    *(Enter your PAT when prompted for the password)*
+```bash
+docker run --rm -it \
+  -v /path/to/your/host/models/YourModelName:/models:rw \
+  quantizer \
+  python quantize.py --model_path /models --awq
+```
 
-4. **Push to the Registry:**
+*   Output: Quantized files (`*-AWQ.safetensors`, `quant_config-AWQ.json`, modified `model.safetensors.index.json`) will be saved *directly* within the mounted `/path/to/your/host/models/YourModelName` directory.
 
-    ```bash
-    # Example for GHCR:
-    docker push ghcr.io/<your-ghcr-username>/<image-name>:<tag>
-    ```
+#### 2. GPTQ Quantization (8-bit, CPU Only - Very Slow)
 
-5. **Using the Image (Example: Unraid Docker Template):**
+This requires specifying the `--gptq` flag.
 
-    You can now pull and use this image on other systems. For example, in Unraid's Docker tab:
-    - **Repository:** `ghcr.io/<your-ghcr-username>/<image-name>:<tag>` (or your specific image path)
-    - **GPU Allocation:** Pass through NVIDIA GPUs if desired.
-    - **Volume Mappings:**
-        - Map a host path containing your model to `/models` with **Read/Write** access.
-          (e.g., Host: `/mnt/user/models/my_model/`, Container: `/models`, Mode: Read/Write)
-    - **Extra Parameters / Post Arguments:** Add the `quantize.py` arguments needed for your specific model:
-        ```bash
-        --model_path /models --quant_config '{"w_bit": 4, "q_group_size": 128, "zero_point": true, "version": "GEMM"}'
-        ```
+```bash
+docker run --rm -it \
+  -v /path/to/your/host/models/YourModelName:/models:rw \
+  quantizer \
+  python quantize.py --model_path /models --gptq
+```
 
-    *Note: The Unraid steps are provided as an example; adapt configuration for your specific environment.*
+*   Optional GPTQ parameters:
+
+```bash
+docker run --rm -it \
+  -v /path/to/your/host/models/YourModelName:/models:rw \
+  quantizer \
+  python quantize.py --model_path /models --gptq --gptq_dataset c4 --gptq_group_size 64 --gptq_desc_act
+```
+
+*   Output: A new subdirectory named `GPTQ_8bit_CPU` will be created *inside* the mounted `/path/to/your/host/models/YourModelName` directory. This subdirectory will contain the full GPTQ quantized model, tokenizer, and config files.
+
+## Notes
+
+*   Ensure the host model directory you mount (`/path/to/your/host/models/YourModelName`) is writable by the Docker container (`:rw`).
+*   Quantization can be memory-intensive. Monitor resource usage.
+*   Both AWQ and GPTQ quantization methods are **forced to run on the CPU** in this script. GPTQ on CPU is extremely slow.
+*   Logs are written to `quantize.log` inside the container and also printed to the console.
+
+## Unraid Specific Setup
+
+When configuring this container via the Unraid GUI:
+
+1.  **Repository:** `quantizer` (or the name you used during the build).
+2.  **Extra Parameters:** Add `python quantize.py` followed by any desired flags (e.g., `python quantize.py --gptq` or `python quantize.py --awq --quant_config '{"q_group_size": 64}'`). If no flags like `--awq` or `--gptq` are added, it will default to AWQ.
+3.  **GPU:** GPU passthrough is **not required** as the script only uses the CPU.
+4.  **Volume Mappings:** Map your host model directory (e.g., `/mnt/user/models/YourModelName`) to the container path (e.g., `/models`) with Read/Write access.

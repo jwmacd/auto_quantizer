@@ -1,5 +1,6 @@
 torch>=2.1.0 --index-url https://download.pytorch.org/whl/cu121
-transformers>=4.38.0
+transformers>=4.36.0
 autoawq>=0.2.0
-accelerate>=0.28.0
+accelerate>=0.25.0
 safetensors>=0.4.0
+optimum[gptq]>=1.16.0
