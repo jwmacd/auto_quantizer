@@ -1,110 +1,157 @@
-# LLM Quantizer Docker (CPU-Focused AWQ/GPTQ)
+# LLM Auto Quantizer (CPU-Based AWQ/GPTQ Quantization)
 
-This project provides a Dockerized environment for quantizing large language models using either AWQ (Activation-aware Weight Quantization) or GPTQ (Generative Pre-trained Transformer Quantization) methods.
+This project provides a Dockerized environment for **performing quantization of large language models** using either AWQ or GPTQ methods on **CPU-only** systems. This makes the quantization process accessible to users without dedicated GPUs.
 
-**IMPORTANT:** This tool is specifically designed and configured for **CPU-based quantization**. While the base Docker image includes CUDA libraries, the quantization script (`quantize.py`) explicitly forces execution on the CPU for both AWQ and GPTQ methods. The primary goal is to create smaller, potentially faster-inferencing models that are compatible with CPU execution environments.
+## Overview
 
-## Features
+**Purpose:** This tool automatically performs model quantizations using the CPU, producing standard AWQ (4-bit) or GPTQ (8-bit) format models that can later be used for inference on either CPU or GPU with appropriate frameworks.
 
-*   Quantize models using AWQ (4-bit default) or GPTQ (8-bit default).
-*   Runs entirely within a Docker container, simplifying dependency management.
-*   **CPU execution is enforced** for compatibility and accessibility.
-*   Simple command-line interface.
-*   Handles model loading, quantization, and saving.
-*   AWQ outputs preserve the original model files, adding suffixed files and a separate index.
-*   GPTQ outputs are saved to a dedicated subdirectory.
+**Key Benefits:**
+* **No GPU Required:** Run quantization operations entirely on CPU hardware
+* **Simplified Setup:** Docker encapsulates all dependencies
+* **Multiple Methods:** Supports both AWQ (4-bit, faster) and GPTQ (8-bit, higher quality but slower)
+* **Standard Output:** Creates quantized models compatible with standard inference tools
+* **Consistent Output Format:** Both methods preserve original files and add suffixed versions
+
+## Technical Details
+
+| Method | Default Bits | Speed on CPU | Output Location | Use Case |
+|--------|-------------|--------------|-----------------|----------|
+| AWQ    | 4-bit       | Reasonable   | Original directory with `-AWQ` suffix | Smaller model files for faster inference |
+| GPTQ   | 8-bit       | Slow    | Original directory with `-GPTQ` suffix | Better quality but with slightly larger model files |
 
 ## Prerequisites
 
-*   Docker installed on your system.
-*   Sufficient disk space for the Docker image and models.
-*   A pre-trained model in Hugging Face format (containing `config.json`, tokenizer files, and model weights, preferably in `safetensors` format).
+* Docker installed on your system
+* Sufficient disk space for Docker image (~4GB) and models
+* A pre-trained model in Hugging Face format (must contain `config.json`, tokenizer files, and model weights in `safetensors` format for best results)
 
-## Building the Docker Image
+## Quick Start
 
-1.  Clone this repository:
-    ```bash
-    git clone https://github.com/jwmacd/quantizer_docker.git # Replace with actual URL if different
-    cd quantizer_docker
-    ```
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/jwmacd/auto_quantizer.git
+   cd auto_quantizer
+   ```
 
-2.  Build the Docker image:
-    ```bash
-    # Build locally with a simple tag
-    docker build -t quantizer .
-    
-    # Optional: Tag for pushing to a registry (e.g., GHCR)
-    # docker tag quantizer ghcr.io/your-username/your-repo:latest
-    # docker push ghcr.io/your-username/your-repo:latest
-    ```
+2. **Build the Docker image**
+   ```bash
+   docker build -t auto_quantizer .
+   ```
 
-## Running the Quantization Script (Usage)
+3. **Run AWQ quantization (default, 4-bit)**
+   ```bash
+   docker run --rm -it \
+     -v /path/to/your/host/models/YourModelName:/models:rw \
+     auto_quantizer
+   ```
 
-The container uses an `ENTRYPOINT` which defaults to running `python /app/quantize.py`. You provide arguments *after* the image name in your `docker run` command, which are passed directly to the script.
+4. **Run GPTQ quantization (8-bit, slower)**
+   ```bash
+   docker run --rm -it \
+     -v /path/to/your/host/models/YourModelName:/models:rw \
+     auto_quantizer \
+     --gptq
+   ```
 
-You **must** mount the host directory containing your model into the container at the path `/models` using the `-v` flag.
+## Detailed Usage
 
-### Command-Line Arguments for `quantize.py`
+### Command-Line Arguments
 
-*   `--model_path`: Path *inside the container* to the model directory. **Default: `/models`** (You usually don't need to specify this if you mount your model to `/models`).
-*   `--awq`: (Flag) Use AWQ quantization (4-bit). **This is the default behavior** if neither `--awq` nor `--gptq` is specified.
-*   `--gptq`: (Flag) Use GPTQ quantization (8-bit). **Warning:** This is extremely slow on the CPU.
-*   `--bits`: (Optional) Number of bits for quantization. Default: 4 for `awq`, 8 for `gptq`. Currently, only these defaults are supported by the script.
-*   `--quant_config`: (Optional) JSON string for custom quantization config, merging with method defaults (e.g., `'{"q_group_size": 64}'`). Note the escaped quotes if running directly in bash.
-*   `--gptq_dataset`: (Optional, for GPTQ only) Dataset name from Hugging Face Datasets for GPTQ calibration. Default: `wikitext2`.
-*   `--gptq_group_size`: (Optional, for GPTQ only) Group size for GPTQ quantization. Default: 128.
-*   `--gptq_desc_act`: (Optional, flag, for GPTQ only) Use descending activation order for GPTQ. Default: False.
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--model_path` | Path to model directory inside container | `/models` |
+| `--awq` | Use AWQ quantization | Default if neither specified |
+| `--gptq` | Use GPTQ quantization | - |
+| `--bits` | Number of bits for quantization | 4 (AWQ), 8 (GPTQ) |
+| `--quant_config` | JSON string for custom quantization config | `{}` |
+| `--gptq_dataset` | Dataset for GPTQ calibration | `wikitext2` |
+| `--gptq_group_size` | Group size for GPTQ quantization | 128 |
+| `--gptq_desc_act` | Use descending activation order for GPTQ | `false` |
 
-### Example Docker Run Commands
+### AWQ Examples
 
-Replace `/path/to/your/host/models/YourModelName` with the actual path to your model directory on the host machine.
-
-#### 1. AWQ Quantization (4-bit, CPU - Easiest/Default)
-
-Since `--model_path` defaults to `/models` and `--awq` is the default method, you only need to provide the volume mount:
-
+**Basic AWQ (4-bit):**
 ```bash
 docker run --rm -it \
   -v /path/to/your/host/models/YourModelName:/models:rw \
-  quantizer
+  auto_quantizer
 ```
 
-*   Output: New AWQ files (`*-AWQ.safetensors`, `quant_config-AWQ.json`, `model-AWQ.safetensors.index.json`) will be saved *directly* within the mounted `/path/to/your/host/models/YourModelName` directory, alongside the original files.
-
-#### 2. GPTQ Quantization (8-bit, CPU Only - Very Slow)
-
-Requires specifying the `--gptq` flag after the image name:
-
+**Custom AWQ configuration:**
 ```bash
 docker run --rm -it \
   -v /path/to/your/host/models/YourModelName:/models:rw \
-  quantizer \
+  auto_quantizer \
+  --awq --quant_config '{"q_group_size": 64, "zero_point": true}'
+```
+
+### GPTQ Examples
+
+**Basic GPTQ (8-bit):**
+```bash
+docker run --rm -it \
+  -v /path/to/your/host/models/YourModelName:/models:rw \
+  auto_quantizer \
   --gptq
 ```
 
-*   Optional GPTQ parameters:
-
+**Custom GPTQ configuration:**
 ```bash
 docker run --rm -it \
   -v /path/to/your/host/models/YourModelName:/models:rw \
-  quantizer \
+  auto_quantizer \
   --gptq --gptq_dataset c4 --gptq_group_size 64 --gptq_desc_act
 ```
 
-*   Output: A new subdirectory named `GPTQ_8bit_CPU` will be created *inside* the mounted `/path/to/your/host/models/YourModelName` directory. This subdirectory will contain the full GPTQ quantized model, tokenizer, and config files.
+## Output Files
 
-## Notes
+### AWQ Output
+The AWQ quantization process preserves all original files and adds:
+* `*-AWQ.safetensors` - Quantized model weights
+* `quant_config-AWQ.json` - Quantization configuration
+* `model-AWQ.safetensors.index.json` - Index for multi-file models
+* Any custom `.py` files will be renamed with `-AWQ` suffix
 
-*   Ensure the host model directory you mount is writable (`:rw`).
-*   Quantization can be memory-intensive. Monitor resource usage.
-*   GPTQ on CPU is extremely slow and primarily included for completeness or specific testing scenarios.
-*   Logs are written to `quantize.log` inside the container's `/app` directory and also printed to the console.
+### GPTQ Output
+The GPTQ quantization also preserves all original files and adds:
+* `*-GPTQ.safetensors` or `*-GPTQ.bin` - Quantized model weights
+* `config-GPTQ.json` - Configuration with quantization parameters
+* `model-GPTQ.safetensors.index.json` - Index for multi-file models
+* Any custom `.py` files will be renamed with `-GPTQ` suffix
 
-## Unraid Specific Setup
+## Resource Requirements
+
+* **Memory:** AWQ typically requires 1.5-2x the original model size temporarily
+* **Disk:** Need space for original model + quantized output
+* **Time:** Expect several hours for quantization on CPU depending on model size
+
+## Unraid Integration
 
 When configuring this container via the Unraid GUI:
 
-1.  **Repository:** Use the tag you built locally (e.g., `quantizer`) or the tag you pushed/pulled from a registry (e.g., `ghcr.io/jwmacd/quantizer_docker:latest`).
-2.  **Extra Parameters / Post Arguments:** Add only the *arguments* for the script (e.g., leave blank for default AWQ, or add `--gptq` for GPTQ, or add `--awq --quant_config '{"q_group_size": 64}'` for custom AWQ). Do **not** include `python quantize.py` here, as the `ENTRYPOINT` handles that.
-3.  **GPU:** GPU passthrough is **not required** as the script only uses the CPU.
-4.  **Volume Mappings:** Map your host model directory (e.g., `/mnt/user/models/YourModelName`) to the container path `/models` with Read/Write access.
+1. **Repository:** Use `auto_quantizer` or your pushed tag
+2. **Extra Parameters:** Add script arguments (e.g., `--gptq --gptq_dataset c4` for custom GPTQ)
+3. **GPU:** Not required (CPU-only quantization)
+4. **Volume Mappings:** Map `/mnt/user/models/YourModelName` to `/models` with Read/Write
+
+## Troubleshooting
+
+* **Memory Issues:** Reduce model size or increase system swap space
+* **File Permission Errors:** Ensure mounted volume has proper write permissions
+* **Slow Quantization:** GPTQ on CPU is extremely slow by design, consider AWQ
+* **Docker Errors:** Check Docker logs with `docker logs <container_id>`
+
+## Technical Implementation
+
+This project uses:
+* Python 3.x with PyTorch 2.x
+* AutoAWQ for 4-bit quantization
+* Transformers/Optimum for GPTQ 8-bit quantization
+* Docker for dependency management and isolation
+
+The core functionality is in `quantize.py`, which handles argument parsing, model loading, quantization, and saving the results.
+
+## License
+
+This project is open source. Please contribute by reporting issues or submitting pull requests.

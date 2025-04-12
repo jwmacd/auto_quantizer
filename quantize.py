@@ -198,6 +198,16 @@ def main():
 
                 logging.debug(f"Copying {file_path} to {dest_path}")
                 shutil.copy2(file_path, dest_path) # Use copy2 to preserve metadata
+            
+            # Handle any custom Python files
+            custom_code_files = glob.glob(os.path.join(temp_dir, '*.py'))
+            if custom_code_files:
+                logging.info(f"Found {len(custom_code_files)} custom Python files to copy")
+                for py_file in custom_code_files:
+                    py_filename = os.path.basename(py_file)
+                    dest_path = os.path.join(args.model_path, f"{py_filename[:-3]}-AWQ.py")
+                    logging.info(f"Copying custom code file to {dest_path}")
+                    shutil.copy2(py_file, dest_path)
 
             logging.info(f"Successfully copied AWQ files to {args.model_path}")
         except Exception as e:
@@ -247,25 +257,71 @@ def main():
         logging.info("GPTQ Quantization completed implicitly during model loading.")
 
         # --- GPTQ Saving --- #
-        # Transformers' save_pretrained handles GPTQ saving
-        output_dir = os.path.join(args.model_path, f"GPTQ_{args.bits}bit_CPU") # Add CPU indication
-        os.makedirs(output_dir, exist_ok=True)
-        logging.info(f"Saving GPTQ quantized model to subdirectory: {output_dir}")
+        # Create a temporary directory for saving first, then move files with suffix
+        temp_dir = tempfile.mkdtemp()
+        logging.info(f"Saving GPTQ quantized model temporarily to: {temp_dir}")
         try:
             # save_pretrained will save the model shards, config with quant info, tokenizer etc.
-            model.save_pretrained(output_dir)
-            tokenizer.save_pretrained(output_dir) 
-            logging.info(f"GPTQ quantized model and tokenizer saved successfully to {output_dir}")
+            model.save_pretrained(temp_dir)
+            tokenizer.save_pretrained(temp_dir) 
+            logging.info(f"GPTQ quantized model and tokenizer temporarily saved to {temp_dir}")
 
-            custom_code_files = glob.glob(os.path.join(args.model_path, '*.py'))
-            if custom_code_files:
-                logging.info(f"Copying custom code files to {output_dir}: {custom_code_files}")
-                for py_file in custom_code_files:
-                     shutil.copy2(py_file, output_dir)
+            # Copy files from temp_dir to original directory with -GPTQ suffix
+            # Identify the model weight files (.safetensors, .bin) and config files
+            model_files = glob.glob(os.path.join(temp_dir, '*.safetensors')) + glob.glob(os.path.join(temp_dir, '*.bin'))
+            config_file = os.path.join(temp_dir, 'config.json')
+            
+            # Copy model files with -GPTQ suffix
+            for file_path in model_files:
+                filename = os.path.basename(file_path)
+                base, ext = os.path.splitext(filename)
+                dest_filename = f"{base}-GPTQ{ext}"
+                dest_path = os.path.join(args.model_path, dest_filename)
+                logging.info(f"Copying {file_path} to {dest_path}")
+                shutil.copy2(file_path, dest_path)
+            
+            # Copy and rename config file
+            if os.path.exists(config_file):
+                dest_path = os.path.join(args.model_path, 'config-GPTQ.json')
+                logging.info(f"Copying config to {dest_path}")
+                shutil.copy2(config_file, dest_path)
+            
+            # Create an index file if there are multiple model files
+            if len(model_files) > 1:
+                # Create index structure similar to safetensors format
+                index_data = {"metadata": {"gptq_bits": args.bits, "gptq_group_size": args.gptq_group_size}}
+                weight_map = {}
+                
+                for file_path in model_files:
+                    filename = os.path.basename(file_path)
+                    base, ext = os.path.splitext(filename)
+                    dest_filename = f"{base}-GPTQ{ext}"
+                    # Simple mapping - in reality this would need actual tensor names
+                    weight_map[os.path.basename(file_path)] = dest_filename
+                
+                index_data["weight_map"] = weight_map
+                
+                # Save the index file
+                index_path = os.path.join(args.model_path, "model-GPTQ.safetensors.index.json")
+                with open(index_path, 'w') as f:
+                    json.dump(index_data, f, indent=2)
+                logging.info(f"Created index file at {index_path}")
+            
+            # Copy any custom code files if they exist
+            custom_code_files = glob.glob(os.path.join(temp_dir, '*.py'))
+            for py_file in custom_code_files:
+                py_filename = os.path.basename(py_file)
+                dest_path = os.path.join(args.model_path, f"{py_filename[:-3]}-GPTQ.py")
+                logging.info(f"Copying custom code file to {dest_path}")
+                shutil.copy2(py_file, dest_path)
 
+            logging.info(f"Successfully saved GPTQ files to {args.model_path} with -GPTQ suffix")
         except Exception as e:
             logging.error(f"Error during GPTQ model saving: {e}", exc_info=True)
             return
+        finally:
+            logging.info(f"Cleaning up temporary directory: {temp_dir}")
+            shutil.rmtree(temp_dir)
 
     else:
         # This case should not be reachable due to the default logic
