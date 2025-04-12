@@ -10,7 +10,14 @@ from transformers import AutoTokenizer
 import logging
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("quantize.log"), # Log to a file
+        logging.StreamHandler()             # Log to console
+    ]
+)
 
 # Define a default quantization configuration
 DEFAULT_QUANT_CONFIG = {
@@ -43,6 +50,18 @@ def main():
     parser.add_argument('--model_path', type=str, required=False,
                         default='/models',
                         help='Path to the directory containing the pre-trained model and tokenizer (e.g., HF model format). Output files will also be saved here.')
+    parser.add_argument('--zero_point', type=bool, required=False,
+                        default=True,
+                        help='Whether to use zero point quantization.')
+    parser.add_argument('--q_group_size', type=int, required=False,
+                        default=128,
+                        help='Quantization group size.')
+    parser.add_argument('--w_bit', type=int, required=False,
+                        default=4,
+                        help='Weight bit width.')
+    parser.add_argument('--version', type=str, required=False,
+                        default="GEMM",
+                        help='Quantization version.')
     # Correctly escape the inner JSON example within the help string for the JSON parser
     parser.add_argument('--quant_config', type=str, required=False,
                         default=DEFAULT_QUANT_CONFIG_STR,
@@ -87,36 +106,38 @@ def main():
         logging.error(f"An unexpected error occurred during quant_config processing: {e}")
         return
 
-    # --- Device Selection ---
-    # Use CUDA if available, otherwise fallback to CPU (with warning)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logging.info(f"Using device: {device}")
-    if device == "cpu":
-        logging.warning("Running on CPU. Quantization may be very slow and might not be fully supported by all AWQ features.")
-        max_memory_map = None # No memory map needed for CPU
-    else:
-        # Dynamically create max_memory map for available GPUs inside the container
-        num_gpus = torch.cuda.device_count()
-        logging.info(f"Detected {num_gpus} CUDA devices available inside the container.")
-        # Assign 23GiB to each detected GPU. Indices inside container are 0, 1, ... num_gpus-1
-        # These will map to the host GPUs specified in the docker run --gpus flag.
-        max_memory_map = {i: "23GiB" for i in range(num_gpus)}
-        logging.info(f"Generated max_memory map: {max_memory_map}")
+    # --- Define Quantization Configuration Early --- 
+    # Use wikitext2 for calibration instead of the default pile-val-backup
+    quant_config = {
+        "zero_point": args.zero_point,
+        "q_group_size": args.q_group_size,
+        "w_bit": args.w_bit,
+        "version": args.version,
+    }
+    logging.info(f"Using quantization config: {quant_config}")
 
-    # --- Load Model and Tokenizer ---
-    logging.info(f"Loading model and tokenizer from: {args.model_path}")
+    # --- Device Selection --- # Force CPU
+    device = "cpu" 
+    logging.info(f"Forcing device: {device}")
+    max_memory_map = None # Not used for CPU
+
+    # --- Load Model and Tokenizer --- # Moved Tokenizer loading earlier
+    logging.info(f"Loading tokenizer from: {args.model_path}")
     try:
         # Load tokenizer using the provided model path
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
         logging.info("Tokenizer loaded successfully.")
+    except Exception as e:
+        logging.error(f"Error loading tokenizer from '{args.model_path}': {e}", exc_info=True)
+        return # Exit if tokenizer loading fails
 
+    logging.info(f"Loading model from: {args.model_path}") # Separate model loading log
+    try:
         # Load model for AWQ quantization using the provided model path
         # AutoAWQForCausalLM.from_pretrained handles loading safetensors if present
         # and mapping to device.
         model = AutoAWQForCausalLM.from_pretrained(
             args.model_path,
-            max_memory=max_memory_map, # Reintroduced dynamic max_memory map
-            device_map="auto", # Let Hugging Face Accelerate handle device mapping
             trust_remote_code=True,
             safetensors=True, # Prefer safetensors loading if available
         )
@@ -124,16 +145,19 @@ def main():
 
     except Exception as e:
         # Provide more context in error logging
-        logging.error(f"Error loading model or tokenizer from '{args.model_path}': {e}", exc_info=True) # Log traceback
-        return
+        logging.error(f"Error loading model from '{args.model_path}': {e}", exc_info=True) # Log traceback for model only
+        return # Exit if model loading fails
 
-    # --- Perform Quantization ---
-    logging.info("Starting quantization...")
+    # --- Quantization --- 
+    logging.info(f"Starting quantization with config: {quant_config}")
     try:
-        # Perform in-place quantization of the loaded model
-        model.quantize(tokenizer, quant_config=quant_config)
-        logging.info("Quantization completed.")
+        model.quantize(
+            tokenizer,
+            quant_config=quant_config, # Pass the pre-defined config
+        )
+        logging.info("Quantization completed successfully.")
     except Exception as e:
+        # Log the specific error during quantization
         logging.error(f"Error during quantization: {e}", exc_info=True) # Log traceback
         return
 
