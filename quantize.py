@@ -184,7 +184,6 @@ def main():
                     }
                     
                     # Use the safetensors library to extract tensor names from each file
-                    import json
                     from safetensors import safe_open
                     
                     for safetensor_file in safetensors_files:
@@ -358,7 +357,6 @@ def main():
                 }
                 
                 # Use the safetensors library to extract tensor names from each file
-                import json
                 from safetensors import safe_open
                 
                 for file_path in model_files:
