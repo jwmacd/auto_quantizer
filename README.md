@@ -65,8 +65,9 @@ This project provides a Dockerized environment for **performing quantization of 
 | `--gptq` | Use GPTQ quantization | - |
 | `--bits` | Number of bits for quantization | 4 (AWQ), 8 (GPTQ) |
 | `--quant_config` | JSON string for custom quantization config | `{}` |
-| `--max_memory` | Maximum memory to use for model loading | Auto-detect |
-| `--cpu_offload` | Enable CPU offloading for memory efficiency | `false` |
+| `--max_memory` | Maximum memory to use for model loading | Auto-detected based on GPU |
+| `--cpu_offload` | Enable CPU offloading for memory efficiency | `true` on GPU, `false` on CPU |
+| `--no_cpu_offload` | Disable CPU offloading (overrides --cpu_offload) | `false` |
 | `--load_in_8bit` | Load model in 8-bit mode first (uses less memory but may affect quality) | `false` |
 | `--gptq_dataset` | Dataset for GPTQ calibration | `wikitext2` |
 | `--gptq_group_size` | Group size for GPTQ quantization | 128 |
@@ -76,7 +77,7 @@ This project provides a Dockerized environment for **performing quantization of 
 
 **Basic AWQ (4-bit):**
 ```bash
-# GPU Usage (requires Docker with GPU support)
+# GPU Usage (automatically uses optimal settings)
 docker run --rm -it --gpus all \
   -v /path/to/your/host/models/YourModelName:/models:rw \
   auto_quantizer
@@ -87,13 +88,20 @@ docker run --rm -it \
   auto_quantizer
 ```
 
-**Custom AWQ configuration with memory management:**
+**Custom AWQ configuration:**
 ```bash
 docker run --rm -it --gpus all \
   -v /path/to/your/host/models/YourModelName:/models:rw \
   auto_quantizer \
-  --awq --quant_config '{"q_group_size": 64, "zero_point": true}' \
-  --max_memory "20GiB" --cpu_offload
+  --awq --quant_config '{"q_group_size": 64, "zero_point": true}'
+```
+
+**Override automatic memory management:**
+```bash
+docker run --rm -it --gpus all \
+  -v /path/to/your/host/models/YourModelName:/models:rw \
+  auto_quantizer \
+  --max_memory "15GiB" --no_cpu_offload
 ```
 
 ### GPTQ Examples
@@ -150,13 +158,19 @@ When configuring this container via the Unraid GUI:
 ## Troubleshooting
 
 * **Memory Issues:** 
-  * **Quality-preserving options:**
-    * Use `--max_memory "20GiB"` to limit GPU memory usage (adjust number for your GPU)
-    * Use `--cpu_offload` to enable CPU offloading (slower but uses less GPU memory)
-  * **For extremely large models (where above options fail):**
-    * Use `--load_in_8bit` to initially load model in 8-bit before quantizing (may slightly impact quality)
-  * **Multi-GPU setups:**
-    * `--max_memory '{"cuda:0": "20GiB", "cuda:1": "20GiB", "cpu": "64GiB"}'`
+  * **Default behavior:** The script automatically configures optimal memory settings
+  * **When quantization fails with OOM errors:**
+    * The script will automatically retry with more aggressive memory settings
+    * As a last resort, it will fall back to CPU-only quantization (much slower but reliable)
+  * **For extremely large models:**
+    * Use `--load_in_8bit` for initial 8-bit loading (may slightly impact quality)
+    * For Qwen, LLaMA, Mistral, or Mixtral models, the script applies optimized settings automatically
+  * **To override automatic memory management:**
+    * Use `--max_memory "20GiB"` to explicitly limit GPU memory usage
+    * Use `--no_cpu_offload` to disable CPU offloading (faster but uses more GPU memory)
+  * **Multiple GPUs:**
+    * Use `--gpus '"0"'` in the Docker command to select only the first GPU
+    * The script uses only a single GPU for reliability
   * **CPU-only systems:**
     * Increase system swap space
 * **File Permission Errors:** Ensure mounted volume has proper write permissions

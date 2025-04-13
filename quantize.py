@@ -5,10 +5,17 @@ import torch
 import tempfile
 import shutil
 import glob
+import logging
+import time
+import threading
+import gc
+try:
+    import psutil
+except ImportError:
+    psutil = None  # We'll handle missing psutil gracefully
 from awq import AutoAWQForCausalLM
 from transformers import AutoModelForCausalLM, GPTQConfig, AutoTokenizer
 from datasets import load_dataset
-import logging
 
 # Configure logging
 logging.basicConfig(
@@ -59,8 +66,10 @@ def parse_arguments():
     # GPU memory management options
     parser.add_argument('--max_memory', type=str, default=None,
                         help='Maximum memory to use for model loading, format: "24GiB" or {"cuda:0": "24GiB"}. Default: auto-detect.')
-    parser.add_argument('--cpu_offload', action='store_true',
-                        help='Enable CPU offloading for memory efficiency (reduces GPU memory usage but slower).')
+    parser.add_argument('--cpu_offload', action='store_true', default=None,
+                        help='Enable CPU offloading for memory efficiency (enabled by default, use --no_cpu_offload to disable).')
+    parser.add_argument('--no_cpu_offload', action='store_true',
+                        help='Disable CPU offloading (overrides --cpu_offload)')
     parser.add_argument('--load_in_8bit', action='store_true', default=False,
                         help='Load model in 8-bit mode first to reduce memory usage (may slightly impact quality).')
     
@@ -81,10 +90,98 @@ def parse_arguments():
 
     return args
 
+def calculate_safe_memory_limits():
+    """Automatically calculate safe memory limits for both GPU and CPU based on available hardware"""
+    memory_dict = {}
+    
+    # Check for psutil availability
+    if psutil is not None:
+        try:
+            # Get CPU memory information
+            cpu_total_mem = psutil.virtual_memory().total / (1024**3)  # Total RAM in GB
+            cpu_available_mem = psutil.virtual_memory().available / (1024**3)  # Available RAM in GB
+            
+            # Determine how much CPU memory to use (more aggressive on high-memory systems)
+            if cpu_total_mem > 256:  # Very high memory systems (>256GB)
+                # Use up to 80% of available memory or 70% of total, whichever is less
+                cpu_usable_mem = min(cpu_available_mem * 0.8, cpu_total_mem * 0.7)
+            elif cpu_total_mem > 64:  # High memory systems (64-256GB)
+                # Use up to 75% of available memory or 65% of total, whichever is less
+                cpu_usable_mem = min(cpu_available_mem * 0.75, cpu_total_mem * 0.65)
+            elif cpu_total_mem > 16:  # Medium memory systems (16-64GB)
+                # Use up to 70% of available memory or 60% of total, whichever is less
+                cpu_usable_mem = min(cpu_available_mem * 0.7, cpu_total_mem * 0.6)
+            else:  # Low memory systems (<16GB)
+                # Use up to 60% of available memory or 50% of total, whichever is less
+                cpu_usable_mem = min(cpu_available_mem * 0.6, cpu_total_mem * 0.5)
+            
+            # Format CPU memory string (round down to integer GB)
+            cpu_mem_str = f"{int(cpu_usable_mem)}GiB"
+            memory_dict["cpu"] = cpu_mem_str
+            
+            logging.info(f"Auto-configured CPU memory: {cpu_mem_str} (total RAM: {cpu_total_mem:.1f}GB, available: {cpu_available_mem:.1f}GB)")
+        except Exception as e:
+            # Fallback to a reasonable default if memory detection fails
+            memory_dict["cpu"] = "64GiB"
+            logging.warning(f"Error detecting CPU memory details: {e}. Using default 64GiB.")
+    else:
+        # psutil is not available, use a reasonable default
+        memory_dict["cpu"] = "64GiB"
+        logging.warning("The 'psutil' package is not installed. Using default CPU memory limit of 64GiB.")
+    
+    # Add GPU memory allocation if available - using ONLY the first GPU (cuda:0)
+    if torch.cuda.is_available():
+        try:
+            # We'll only use the first GPU (cuda:0) to avoid multi-GPU complexity
+            if torch.cuda.device_count() > 1:
+                logging.info(f"Multiple GPUs detected ({torch.cuda.device_count()}), but using only the first GPU for reliability")
+            
+            # Get total GPU memory for first GPU only
+            total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # Convert to GB
+            free_mem = torch.cuda.mem_get_info(0)[0] / (1024**3)  # Free memory in GB
+            
+            # Use a conservative percentage of total memory
+            # Reserve more for larger GPUs, less for smaller ones
+            if total_mem > 20:  # High-end GPUs (24GB+)
+                # Reserve 20% of total memory or 4GB, whichever is greater
+                reserve_percentage = 0.20
+                minimum_reserve = 4
+            elif total_mem > 10:  # Mid-range GPUs (12-16GB)
+                # Reserve 15% of total memory or 2GB, whichever is greater
+                reserve_percentage = 0.15
+                minimum_reserve = 2
+            else:  # Low-end GPUs (<10GB)
+                # Reserve 10% of total memory or 1GB, whichever is greater
+                reserve_percentage = 0.10
+                minimum_reserve = 1
+            
+            # Calculate reserve amount
+            reserve_amount = max(total_mem * reserve_percentage, minimum_reserve)
+            
+            # Calculate usable memory
+            usable_mem = total_mem - reserve_amount
+            
+            # Format as string
+            usable_mem_str = f"{int(usable_mem)}GiB"
+            
+            # Create memory dict with ONLY cuda:0 (single GPU)
+            memory_dict = {
+                "cuda:0": usable_mem_str,  # Only use first GPU
+                "cpu": memory_dict.get("cpu", "64GiB")  # Keep CPU allocation
+            }
+            
+            logging.info(f"Auto-configured GPU memory: {usable_mem_str} (total: {total_mem:.1f}GB, reserved: {reserve_amount:.1f}GB)")
+        except Exception as e:
+            logging.warning(f"Error calculating GPU memory: {e}. Using automatic device mapping.")
+            return {"cuda:0": "auto", "cpu": memory_dict.get("cpu", "64GiB")}  # Fall back to auto but still limit to first GPU
+    
+    return memory_dict
+
 def parse_max_memory(max_memory_str):
     """Parse max_memory argument into a usable format for device_map"""
     if not max_memory_str:
-        return None
+        # No explicit value provided, use automatic calculation
+        return calculate_safe_memory_limits()
     
     try:
         # Check if it's a JSON string like '{"cuda:0": "24GiB"}'
@@ -92,24 +189,42 @@ def parse_max_memory(max_memory_str):
             return json.loads(max_memory_str)
         # Otherwise assume it's a simple string like "24GiB"
         else:
-            # If GPU is available, create a dict for device_map
+            # Start with auto-detected CPU memory values
+            memory_dict = {}
+            try:
+                # Get automatic CPU memory value
+                auto_limits = calculate_safe_memory_limits()
+                if "cpu" in auto_limits:
+                    memory_dict["cpu"] = auto_limits["cpu"]
+                else:
+                    memory_dict["cpu"] = "64GiB"  # Fallback
+            except:
+                memory_dict["cpu"] = "64GiB"  # Fallback if auto-detection fails
+            
+            # Apply GPU memory limit from provided value - ONLY to the first GPU
             if torch.cuda.is_available():
-                memory_dict = {}
-                for i in range(torch.cuda.device_count()):
-                    memory_dict[f"cuda:{i}"] = max_memory_str
-                memory_dict["cpu"] = "64GiB"  # Also include CPU
-                return memory_dict
-            else:
-                return {"cpu": max_memory_str}
+                # Only use the first GPU to avoid multi-GPU errors
+                memory_dict["cuda:0"] = max_memory_str
+                
+                if torch.cuda.device_count() > 1:
+                    logging.info(f"Multiple GPUs detected ({torch.cuda.device_count()}), but using only the first GPU for reliability")
+                
+            return memory_dict
     except Exception as e:
         logging.warning(f"Error parsing max_memory argument: {e}. Using automatic memory allocation.")
-        return None
+        return calculate_safe_memory_limits()
 
 def main():
     """
     Main function: Parses arguments, validates, selects method (AWQ/GPTQ),
     performs quantization, and saves results.
     """
+    args = parse_arguments()
+    
+    # Process overriding args
+    if args.no_cpu_offload:
+        args.cpu_offload = False  # Disable CPU offloading if explicitly requested
+    
     # Check if GPU is available and log the device that will be used
     gpu_available = torch.cuda.is_available()
     
@@ -120,10 +235,12 @@ def main():
         # Log GPU memory info
         total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         logging.info(f"GPU total memory: {total_mem:.2f} GB")
+        
+        # Set default optimizations for GPU
+        if args.cpu_offload is None:
+            args.cpu_offload = True  # Enable by default on GPU for better reliability
     else:
         logging.info("No GPU detected. Using CPU for quantization (will be slow)")
-        
-    args = parse_arguments()
 
     # --- Argument Validation and Setup --- #
     logging.info(f"Starting quantization process with args: {args}")
@@ -169,125 +286,51 @@ def main():
     # Use the device determined at the start (CPU or GPU)
 
     if quantization_method == 'awq':
-        # --- AWQ Quantization (CPU Only) --- # 
+        # --- AWQ Quantization --- # 
         
         # Merge default AWQ config with custom config
         quant_config = {**DEFAULT_AWQ_CONFIG, **custom_config}
         quant_config['w_bit'] = args.bits # Ensure bits argument overrides config
         logging.info(f"Using AWQ quantization config: {quant_config}")
 
-        # Set up device map based on args
-        device_map = "auto"  # Default to auto device map
-        max_memory = parse_max_memory(args.max_memory)
-        
+        # Only use the first GPU to avoid multi-GPU complexity
         if gpu_available:
-            if args.cpu_offload:
-                logging.info("CPU offloading enabled for memory efficiency")
-                device_map = "auto"
-            elif max_memory:
-                logging.info(f"Using custom memory limits: {max_memory}")
-                device_map = max_memory
-            else:
-                # Try to auto-determine conservative memory usage
-                # Reserve 2GB of GPU memory for quantization processes
-                free_mem = torch.cuda.mem_get_info(0)[0] / (1024**3)
-                reserve_mem = 2.0  # 2 GB reserve
-                usable_mem = max(free_mem - reserve_mem, free_mem * 0.8)  # Use at most 80% of free memory
-                
-                logging.info(f"Free GPU memory: {free_mem:.2f} GB, using {usable_mem:.2f} GB for model loading")
-                max_memory = {
-                    "cuda:0": f"{usable_mem:.0f}GiB",
-                    "cpu": "64GiB"
-                }
-                device_map = max_memory
+            # Dynamically create max_memory map for available GPUs
+            num_gpus = torch.cuda.device_count()
+            logging.info(f"Detected {num_gpus} CUDA devices available")
+            
+            # Create a simpler memory map with a single GPU
+            # This is a critical change from the working version
+            max_memory = {0: "23GiB"}  # Allocate fixed 23GB to first GPU only
+            
+            if torch.cuda.device_count() > 1:
+                logging.info(f"Multiple GPUs detected ({torch.cuda.device_count()}), but using only the first GPU for reliability")
+            
+            logging.info(f"Using GPU memory map: {max_memory}")
         else:
-            device_map = "cpu"
+            max_memory = None
+            logging.info("No GPU available, using CPU only")
         
-        logging.info(f"Loading model for AWQ from: {args.model_path} with device_map: {device_map}")
+        logging.info(f"Loading model for AWQ from: {args.model_path}")
         try:
-            # Two approaches:
-            # 1. Memory-optimized: Load in 8-bit first, then quantize (may affect quality due to double quantization)
-            # 2. Quality-focused: Load directly with shard loading and CPU offloading (may use more memory)
-            
-            # Decide which approach to use based on args and available memory
-            if args.load_in_8bit:
-                try:
-                    logging.info("Loading model in 8-bit mode to reduce memory (NOTE: May slightly impact final quality)")
-                    from transformers import AutoModelForCausalLM
-                    
-                    # Load in 8-bit mode - this dramatically reduces memory usage
-                    unquantized_model = AutoModelForCausalLM.from_pretrained(
-                        args.model_path,
-                        load_in_8bit=True,  # Use 8-bit quantization for loading
-                        device_map="auto",  # Let accelerate handle device mapping
-                        trust_remote_code=True,
-                        safetensors=True,
-                    )
-                    
-                    # Prepare for AWQ quantization
-                    logging.info("Preparing 8-bit model for AWQ quantization")
-                    
-                    # For AWQ, we need to get model type and config from the unquantized model
-                    # But use AutoAWQForCausalLM approach for the quantization
-                    from awq.models.auto import get_model_type
-                    model_type = get_model_type(args.model_path)
-                    
-                    from awq.models.base import BaseAWQForCausalLM
-                    from awq.models import AWQ_CAUSAL_LM_MODEL_MAP
-                    
-                    # Create AWQ model wrapper using the loaded model
-                    model = AWQ_CAUSAL_LM_MODEL_MAP[model_type](unquantized_model)
-                    logging.info(f"Created AWQ model wrapper for {model_type}")
-                    
-                except Exception as e:
-                    logging.error(f"Error during 8-bit model loading: {e}")
-                    logging.info("Falling back to direct loading with optimization")
-                    args.load_in_8bit = False  # Force fallback to other method
-            
-            # Quality-focused approach: direct loading with memory optimizations
-            if not args.load_in_8bit:
-                try:
-                    from accelerate import init_empty_weights, load_checkpoint_and_dispatch
-                    
-                    logging.info("Using direct loading with memory optimizations (better quality)")
-                    # Attempt to load with memory mapping and CPU offloading if needed
-                    
-                    # Step 1: Try optimized model loading approach
-                    logging.info("Loading model in optimized mode with shard merging")
-                    model = AutoAWQForCausalLM.from_pretrained(
-                        args.model_path,
-                        trust_remote_code=True,
-                        safetensors=True,
-                        device_map="auto" if gpu_available else "cpu",
-                        offload_folder="offload" if args.cpu_offload else None,
-                        low_cpu_mem_usage=True,
-                    )
-                    logging.info("Successfully loaded model with optimal settings")
-                    
-                except Exception as first_error:
-                    logging.error(f"Error during optimized loading: {first_error}")
-                    
-                    try:
-                        # Last resort: CPU-only loading
-                        logging.info("Trying CPU-only loading as last resort")
-                        model = AutoAWQForCausalLM.from_pretrained(
-                            args.model_path,
-                            trust_remote_code=True,
-                            safetensors=True,
-                            device_map="cpu",
-                        )
-                    except Exception as e:
-                        logging.error(f"All loading methods failed: {e}")
-                        raise RuntimeError("Failed to load model with any method")
-            logging.info(f"Pre-trained model loaded successfully for AWQ.")
+            # Load model directly with simplified approach (from working version)
+            model = AutoAWQForCausalLM.from_pretrained(
+                args.model_path,
+                max_memory=max_memory,  # Use the simplified memory map
+                device_map="auto",      # Let HF Accelerate handle device mapping
+                trust_remote_code=True,
+                safetensors=True,       # Prefer safetensors loading
+            )
+            logging.info("Pre-trained model loaded successfully.")
         except Exception as e:
             logging.error(f"Error loading model for AWQ from '{args.model_path}': {e}", exc_info=True)
             return
 
         logging.info("Starting AWQ quantization...")
         try:
+            # Simple direct quantization (from working version)
             model.quantize(
-                tokenizer,
+                tokenizer, 
                 quant_config=quant_config
             )
             logging.info("AWQ Quantization completed successfully.")
