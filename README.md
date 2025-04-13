@@ -65,6 +65,9 @@ This project provides a Dockerized environment for **performing quantization of 
 | `--gptq` | Use GPTQ quantization | - |
 | `--bits` | Number of bits for quantization | 4 (AWQ), 8 (GPTQ) |
 | `--quant_config` | JSON string for custom quantization config | `{}` |
+| `--max_memory` | Maximum memory to use for model loading | Auto-detect |
+| `--cpu_offload` | Enable CPU offloading for memory efficiency | `false` |
+| `--load_in_8bit` | Load model in 8-bit mode first (uses less memory but may affect quality) | `false` |
 | `--gptq_dataset` | Dataset for GPTQ calibration | `wikitext2` |
 | `--gptq_group_size` | Group size for GPTQ quantization | 128 |
 | `--gptq_desc_act` | Use descending activation order for GPTQ | `false` |
@@ -73,35 +76,44 @@ This project provides a Dockerized environment for **performing quantization of 
 
 **Basic AWQ (4-bit):**
 ```bash
+# GPU Usage (requires Docker with GPU support)
+docker run --rm -it --gpus all \
+  -v /path/to/your/host/models/YourModelName:/models:rw \
+  auto_quantizer
+
+# CPU Usage (slower but no GPU needed)
 docker run --rm -it \
   -v /path/to/your/host/models/YourModelName:/models:rw \
   auto_quantizer
 ```
 
-**Custom AWQ configuration:**
+**Custom AWQ configuration with memory management:**
 ```bash
-docker run --rm -it \
+docker run --rm -it --gpus all \
   -v /path/to/your/host/models/YourModelName:/models:rw \
   auto_quantizer \
-  --awq --quant_config '{"q_group_size": 64, "zero_point": true}'
+  --awq --quant_config '{"q_group_size": 64, "zero_point": true}' \
+  --max_memory "20GiB" --cpu_offload
 ```
 
 ### GPTQ Examples
 
 **Basic GPTQ (8-bit):**
 ```bash
-docker run --rm -it \
+# IMPORTANT: GPTQ is very slow on CPU - GPU highly recommended
+docker run --rm -it --gpus all \
   -v /path/to/your/host/models/YourModelName:/models:rw \
   auto_quantizer \
   --gptq
 ```
 
-**Custom GPTQ configuration:**
+**Custom GPTQ configuration with memory management:**
 ```bash
-docker run --rm -it \
+docker run --rm -it --gpus all \
   -v /path/to/your/host/models/YourModelName:/models:rw \
   auto_quantizer \
-  --gptq --gptq_dataset c4 --gptq_group_size 64 --gptq_desc_act
+  --gptq --gptq_dataset c4 --gptq_group_size 64 --gptq_desc_act \
+  --max_memory "24GiB" --cpu_offload
 ```
 
 ## Output Files
@@ -132,12 +144,21 @@ When configuring this container via the Unraid GUI:
 
 1. **Repository:** Use `auto_quantizer` or your pushed tag
 2. **Extra Parameters:** Add script arguments (e.g., `--gptq --gptq_dataset c4` for custom GPTQ)
-3. **GPU:** Not required (CPU-only quantization)
+3. **GPU:** Optional but recommended (will use if available)
 4. **Volume Mappings:** Map `/mnt/user/models/YourModelName` to `/models` with Read/Write
 
 ## Troubleshooting
 
-* **Memory Issues:** Reduce model size or increase system swap space
+* **Memory Issues:** 
+  * **Quality-preserving options:**
+    * Use `--max_memory "20GiB"` to limit GPU memory usage (adjust number for your GPU)
+    * Use `--cpu_offload` to enable CPU offloading (slower but uses less GPU memory)
+  * **For extremely large models (where above options fail):**
+    * Use `--load_in_8bit` to initially load model in 8-bit before quantizing (may slightly impact quality)
+  * **Multi-GPU setups:**
+    * `--max_memory '{"cuda:0": "20GiB", "cuda:1": "20GiB", "cpu": "64GiB"}'`
+  * **CPU-only systems:**
+    * Increase system swap space
 * **File Permission Errors:** Ensure mounted volume has proper write permissions
 * **Slow Quantization:** GPTQ on CPU is extremely slow by design, consider AWQ
 * **Docker Errors:** Check Docker logs with `docker logs <container_id>`

@@ -5,14 +5,10 @@ import torch
 import tempfile
 import shutil
 import glob
-import logging
-import time
-import threading
-import gc
-import psutil
 from awq import AutoAWQForCausalLM
 from transformers import AutoModelForCausalLM, GPTQConfig, AutoTokenizer
 from datasets import load_dataset
+import logging
 
 # Configure logging
 logging.basicConfig(
@@ -60,6 +56,14 @@ def parse_arguments():
     parser.add_argument('--quant_config', type=str, default='{}',
                         help='JSON string for custom quantization config, merging with method defaults.')
     
+    # GPU memory management options
+    parser.add_argument('--max_memory', type=str, default=None,
+                        help='Maximum memory to use for model loading, format: "24GiB" or {"cuda:0": "24GiB"}. Default: auto-detect.')
+    parser.add_argument('--cpu_offload', action='store_true',
+                        help='Enable CPU offloading for memory efficiency (reduces GPU memory usage but slower).')
+    parser.add_argument('--load_in_8bit', action='store_true', default=False,
+                        help='Load model in 8-bit mode first to reduce memory usage (may slightly impact quality).')
+    
     # GPTQ specific arguments (only relevant if --gptq is used)
     parser.add_argument('--gptq_dataset', type=str, default=DEFAULT_GPTQ_CONFIG["dataset"],
                         help='Dataset name from Hugging Face Datasets for GPTQ calibration (e.g., wikitext2, c4). Default: wikitext2')
@@ -77,42 +81,52 @@ def parse_arguments():
 
     return args
 
-def log_memory_usage(tag=""):
-    """Log current memory usage with an optional tag for identification"""
-    process = psutil.Process(os.getpid())
-    memory_info = process.memory_info()
+def parse_max_memory(max_memory_str):
+    """Parse max_memory argument into a usable format for device_map"""
+    if not max_memory_str:
+        return None
     
-    # Convert bytes to MB for more readable output
-    rss_mb = memory_info.rss / (1024 * 1024)
-    vms_mb = memory_info.vms / (1024 * 1024)
-    
-    logging.info(f"Memory usage {tag}: RSS={rss_mb:.2f} MB, VMS={vms_mb:.2f} MB")
-    
-    # Log PyTorch memory stats if available
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            allocated = torch.cuda.memory_allocated(i) / (1024 * 1024)
-            reserved = torch.cuda.memory_reserved(i) / (1024 * 1024)
-            logging.info(f"CUDA:{i} memory: Allocated={allocated:.2f} MB, Reserved={reserved:.2f} MB")
+    try:
+        # Check if it's a JSON string like '{"cuda:0": "24GiB"}'
+        if max_memory_str.startswith('{'):
+            return json.loads(max_memory_str)
+        # Otherwise assume it's a simple string like "24GiB"
+        else:
+            # If GPU is available, create a dict for device_map
+            if torch.cuda.is_available():
+                memory_dict = {}
+                for i in range(torch.cuda.device_count()):
+                    memory_dict[f"cuda:{i}"] = max_memory_str
+                memory_dict["cpu"] = "64GiB"  # Also include CPU
+                return memory_dict
+            else:
+                return {"cpu": max_memory_str}
+    except Exception as e:
+        logging.warning(f"Error parsing max_memory argument: {e}. Using automatic memory allocation.")
+        return None
 
 def main():
     """
     Main function: Parses arguments, validates, selects method (AWQ/GPTQ),
-    performs quantization ON CPU, and saves results.
+    performs quantization, and saves results.
     """
-    # Force CPU mode at the beginning of execution
-    # These settings ensure no GPU will be used even if available
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""  # Hide any CUDA devices
-    torch.cuda.is_available = lambda: False  # Ensure CUDA is reported as unavailable
+    # Check if GPU is available and log the device that will be used
+    gpu_available = torch.cuda.is_available()
     
-    # Log initial memory state
-    log_memory_usage("at startup")
-    
+    if gpu_available:
+        logging.info(f"GPU detected: {torch.cuda.get_device_name(0)}")
+        logging.info(f"Using GPU for quantization (much faster)")
+        
+        # Log GPU memory info
+        total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        logging.info(f"GPU total memory: {total_mem:.2f} GB")
+    else:
+        logging.info("No GPU detected. Using CPU for quantization (will be slow)")
+        
     args = parse_arguments()
 
     # --- Argument Validation and Setup --- #
     logging.info(f"Starting quantization process with args: {args}")
-    logging.info("Forcing CPU-only mode for all operations")
 
     # Determine method and set default bits
     quantization_method = "awq" if args.awq else "gptq"
@@ -123,9 +137,8 @@ def main():
             args.bits = 8
     
     logging.info(f"Selected method: {quantization_method.upper()}, Bits: {args.bits}")
-    logging.info(f"Device: CPU (Forced for both methods in this script)")
-    if quantization_method == 'gptq':
-        logging.warning("GPTQ on CPU is EXTREMELY slow.")
+    if not gpu_available and quantization_method == 'gptq':
+        logging.warning("GPTQ on CPU is EXTREMELY slow. Consider using a GPU if available.")
 
     # Validate bits per method
     if quantization_method == 'awq' and args.bits != 4:
@@ -153,12 +166,8 @@ def main():
         return
 
     # --- Method Specific Logic --- #
-    device = "cpu" # Force CPU for all operations
-    
-    # Force PyTorch to only use CPU
-    torch.set_num_threads(torch.get_num_threads())  # Preserve thread count but ensure we're on CPU
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""  # Hide any CUDA devices
-    
+    # Use the device determined at the start (CPU or GPU)
+
     if quantization_method == 'awq':
         # --- AWQ Quantization (CPU Only) --- # 
         
@@ -167,60 +176,121 @@ def main():
         quant_config['w_bit'] = args.bits # Ensure bits argument overrides config
         logging.info(f"Using AWQ quantization config: {quant_config}")
 
-        logging.info(f"Loading model for AWQ from: {args.model_path} onto CPU")
+        # Set up device map based on args
+        device_map = "auto"  # Default to auto device map
+        max_memory = parse_max_memory(args.max_memory)
+        
+        if gpu_available:
+            if args.cpu_offload:
+                logging.info("CPU offloading enabled for memory efficiency")
+                device_map = "auto"
+            elif max_memory:
+                logging.info(f"Using custom memory limits: {max_memory}")
+                device_map = max_memory
+            else:
+                # Try to auto-determine conservative memory usage
+                # Reserve 2GB of GPU memory for quantization processes
+                free_mem = torch.cuda.mem_get_info(0)[0] / (1024**3)
+                reserve_mem = 2.0  # 2 GB reserve
+                usable_mem = max(free_mem - reserve_mem, free_mem * 0.8)  # Use at most 80% of free memory
+                
+                logging.info(f"Free GPU memory: {free_mem:.2f} GB, using {usable_mem:.2f} GB for model loading")
+                max_memory = {
+                    "cuda:0": f"{usable_mem:.0f}GiB",
+                    "cpu": "64GiB"
+                }
+                device_map = max_memory
+        else:
+            device_map = "cpu"
+        
+        logging.info(f"Loading model for AWQ from: {args.model_path} with device_map: {device_map}")
         try:
-            # Ensure no GPU usage
-            torch.cuda.is_available = lambda: False
+            # Two approaches:
+            # 1. Memory-optimized: Load in 8-bit first, then quantize (may affect quality due to double quantization)
+            # 2. Quality-focused: Load directly with shard loading and CPU offloading (may use more memory)
             
-            logging.info("Loading model for AWQ quantization...")
-            log_memory_usage("before model loading")
+            # Decide which approach to use based on args and available memory
+            if args.load_in_8bit:
+                try:
+                    logging.info("Loading model in 8-bit mode to reduce memory (NOTE: May slightly impact final quality)")
+                    from transformers import AutoModelForCausalLM
+                    
+                    # Load in 8-bit mode - this dramatically reduces memory usage
+                    unquantized_model = AutoModelForCausalLM.from_pretrained(
+                        args.model_path,
+                        load_in_8bit=True,  # Use 8-bit quantization for loading
+                        device_map="auto",  # Let accelerate handle device mapping
+                        trust_remote_code=True,
+                        safetensors=True,
+                    )
+                    
+                    # Prepare for AWQ quantization
+                    logging.info("Preparing 8-bit model for AWQ quantization")
+                    
+                    # For AWQ, we need to get model type and config from the unquantized model
+                    # But use AutoAWQForCausalLM approach for the quantization
+                    from awq.models.auto import get_model_type
+                    model_type = get_model_type(args.model_path)
+                    
+                    from awq.models.base import BaseAWQForCausalLM
+                    from awq.models import AWQ_CAUSAL_LM_MODEL_MAP
+                    
+                    # Create AWQ model wrapper using the loaded model
+                    model = AWQ_CAUSAL_LM_MODEL_MAP[model_type](unquantized_model)
+                    logging.info(f"Created AWQ model wrapper for {model_type}")
+                    
+                except Exception as e:
+                    logging.error(f"Error during 8-bit model loading: {e}")
+                    logging.info("Falling back to direct loading with optimization")
+                    args.load_in_8bit = False  # Force fallback to other method
             
-            model = AutoAWQForCausalLM.from_pretrained(
-                args.model_path,
-                trust_remote_code=True,
-                safetensors=True,
-                device_map="cpu" # Explicitly load to CPU with string value
-            )
-            
-            log_memory_usage("after model loading")
-            logging.info("Pre-trained model loaded successfully for AWQ onto CPU.")
+            # Quality-focused approach: direct loading with memory optimizations
+            if not args.load_in_8bit:
+                try:
+                    from accelerate import init_empty_weights, load_checkpoint_and_dispatch
+                    
+                    logging.info("Using direct loading with memory optimizations (better quality)")
+                    # Attempt to load with memory mapping and CPU offloading if needed
+                    
+                    # Step 1: Try optimized model loading approach
+                    logging.info("Loading model in optimized mode with shard merging")
+                    model = AutoAWQForCausalLM.from_pretrained(
+                        args.model_path,
+                        trust_remote_code=True,
+                        safetensors=True,
+                        device_map="auto" if gpu_available else "cpu",
+                        offload_folder="offload" if args.cpu_offload else None,
+                        low_cpu_mem_usage=True,
+                    )
+                    logging.info("Successfully loaded model with optimal settings")
+                    
+                except Exception as first_error:
+                    logging.error(f"Error during optimized loading: {first_error}")
+                    
+                    try:
+                        # Last resort: CPU-only loading
+                        logging.info("Trying CPU-only loading as last resort")
+                        model = AutoAWQForCausalLM.from_pretrained(
+                            args.model_path,
+                            trust_remote_code=True,
+                            safetensors=True,
+                            device_map="cpu",
+                        )
+                    except Exception as e:
+                        logging.error(f"All loading methods failed: {e}")
+                        raise RuntimeError("Failed to load model with any method")
+            logging.info(f"Pre-trained model loaded successfully for AWQ.")
         except Exception as e:
             logging.error(f"Error loading model for AWQ from '{args.model_path}': {e}", exc_info=True)
             return
 
         logging.info("Starting AWQ quantization...")
         try:
-            # Add progress tracking
-            start_time = time.time()
-            logging.info(f"AWQ quantization started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            
-            # Set up a progress checker on a separate thread
-            def log_progress():
-                last_log_time = time.time()
-                while True:
-                    current_time = time.time()
-                    elapsed = current_time - start_time
-                    if current_time - last_log_time >= 300:  # Log every 5 minutes
-                        last_log_time = current_time
-                        logging.info(f"AWQ quantization still in progress... (Elapsed: {elapsed:.2f} seconds)")
-                        log_memory_usage("during AWQ quantization")
-                        # Force garbage collection to get accurate memory readings
-                        gc.collect()
-                    time.sleep(60)  # Check every minute
-                    
-            import threading
-            progress_thread = threading.Thread(target=log_progress, daemon=True)
-            progress_thread.start()
-            
-            log_memory_usage("before AWQ quantization")
             model.quantize(
                 tokenizer,
                 quant_config=quant_config
             )
-            
-            elapsed = time.time() - start_time
-            log_memory_usage("after AWQ quantization")
-            logging.info(f"AWQ Quantization completed successfully in {elapsed:.2f} seconds ({elapsed/60:.2f} minutes).")
+            logging.info("AWQ Quantization completed successfully.")
         except Exception as e:
             logging.error(f"Error during AWQ quantization: {e}", exc_info=True)
             return
@@ -231,105 +301,42 @@ def main():
         logging.info(f"Saving AWQ quantized model temporarily before moving to: {args.model_path}")
         logging.info(f"Using temporary directory: {temp_dir}")
         try:
-            model.save_quantized(temp_dir, shard_size="4GB") # Limit to 4GB for Hugging Face compatibility
+            model.save_quantized(temp_dir, shard_size="10GB") # Increase shard size maybe? CPU might handle larger files better
             logging.info(f"AWQ quantized model temporarily saved to {temp_dir}")
 
-            # Files to copy: *.safetensors, quant_config.json
+            # Files to copy: *.safetensors, quant_config.json, AND model.safetensors.index.json
             files_to_copy = glob.glob(os.path.join(temp_dir, '*.safetensors'))
             files_to_copy.append(os.path.join(temp_dir, 'quant_config.json'))
-            
-            # Handle index file specially
             index_file_temp = os.path.join(temp_dir, 'model.safetensors.index.json')
-            original_index_file = os.path.join(args.model_path, 'model.safetensors.index.json')
-            
+            if os.path.exists(index_file_temp):
+                files_to_copy.append(index_file_temp)
+            else:
+                logging.warning(f"Expected index file not found in temp dir: {index_file_temp}")
+
             logging.info(f"Copying {len(files_to_copy)} AWQ files from temp dir to {args.model_path}")
-            
-            # First, process the model files to collect mapping for index
-            model_file_mapping = {}
             for file_path in files_to_copy:
                 filename = os.path.basename(file_path)
                 # Add -AWQ suffix to safetensors and config files
                 if filename.endswith('.safetensors') and not filename.endswith('-AWQ.safetensors'):
                     # Files in temp_dir don't have suffix yet, add it during copy
-                    orig_name = filename
                     dest_filename = filename.replace(".safetensors", "-AWQ.safetensors")
-                    model_file_mapping[orig_name] = dest_filename
                 elif filename == 'quant_config.json':
                     dest_filename = "quant_config-AWQ.json"
+                # *** RENAME the index file on copy to preserve the original ***
+                elif filename == 'model.safetensors.index.json':
+                     dest_filename = "model-AWQ.safetensors.index.json" # New name for AWQ index
                 else:
-                    # This case should ideally not be hit. Log a warning if it does.
-                    logging.warning(f"Unexpected file found in AWQ temp directory: {filename}. Copying as-is.")
-                    dest_filename = filename 
+                     # This case should ideally not be hit. Log a warning if it does.
+                     logging.warning(f"Unexpected file found in AWQ temp directory: {filename}. Copying as-is.")
+                     dest_filename = filename 
 
                 dest_path = os.path.join(args.model_path, dest_filename)
                 # Safety check - though unlikely to hit originals with this logic
                 if os.path.exists(dest_path):
-                    logging.warning(f"Destination file {dest_path} already exists. Overwriting.") 
+                     logging.warning(f"Destination file {dest_path} already exists. Overwriting.") 
 
                 logging.debug(f"Copying {file_path} to {dest_path}")
                 shutil.copy2(file_path, dest_path) # Use copy2 to preserve metadata
-                
-            # Create proper index file using mapping from original files if it exists
-            if os.path.exists(original_index_file) and model_file_mapping:
-                logging.info(f"Creating AWQ index file based on original index: {original_index_file}")
-                try:
-                    with open(original_index_file, 'r') as f:
-                        index_data = json.load(f)
-                    
-                    # Create new weight map with AWQ file names
-                    if 'weight_map' in index_data:
-                        new_weight_map = {}
-                        for tensor_name, file_name in index_data['weight_map'].items():
-                            # Map to the new AWQ file name if available
-                            base_name = os.path.basename(file_name)
-                            if base_name in model_file_mapping:
-                                new_weight_map[tensor_name] = model_file_mapping[base_name]
-                            else:
-                                # Keep original mapping if not found in our processed files
-                                new_weight_map[tensor_name] = file_name.replace(".safetensors", "-AWQ.safetensors")
-                        
-                        # Update with new weight map
-                        index_data['weight_map'] = new_weight_map
-                        
-                        # Add AWQ metadata
-                        if 'metadata' not in index_data:
-                            index_data['metadata'] = {}
-                        index_data['metadata']['awq_bits'] = args.bits
-                        
-                        # Save the new index file
-                        awq_index_path = os.path.join(args.model_path, "model-AWQ.safetensors.index.json")
-                        with open(awq_index_path, 'w') as f:
-                            json.dump(index_data, f, indent=2)
-                        logging.info(f"Created AWQ index file at {awq_index_path}")
-                    else:
-                        logging.warning("Original index file exists but doesn't contain a weight_map. Creating simplified index.")
-                        # Fall back to simple index file creation
-                        if os.path.exists(index_file_temp):
-                            dest_path = os.path.join(args.model_path, "model-AWQ.safetensors.index.json")
-                            shutil.copy2(index_file_temp, dest_path)
-                            logging.info(f"Copied original AWQ index file to {dest_path}")
-                except Exception as e:
-                    logging.error(f"Error creating AWQ index file: {e}", exc_info=True)
-                    # Fall back to simple index file copy if available
-                    if os.path.exists(index_file_temp):
-                        dest_path = os.path.join(args.model_path, "model-AWQ.safetensors.index.json")
-                        shutil.copy2(index_file_temp, dest_path)
-                        logging.info(f"Copied original AWQ index file to {dest_path} after index creation error")
-            elif os.path.exists(index_file_temp):
-                # Just copy the temp index file if no original index exists
-                dest_path = os.path.join(args.model_path, "model-AWQ.safetensors.index.json")
-                shutil.copy2(index_file_temp, dest_path)
-                logging.info(f"Copied AWQ-generated index file to {dest_path}")
-            
-            # Handle any custom Python files
-            custom_code_files = glob.glob(os.path.join(temp_dir, '*.py'))
-            if custom_code_files:
-                logging.info(f"Found {len(custom_code_files)} custom Python files to copy")
-                for py_file in custom_code_files:
-                    py_filename = os.path.basename(py_file)
-                    dest_path = os.path.join(args.model_path, f"{py_filename[:-3]}-AWQ.py")
-                    logging.info(f"Copying custom code file to {dest_path}")
-                    shutil.copy2(py_file, dest_path)
 
             logging.info(f"Successfully copied AWQ files to {args.model_path}")
         except Exception as e:
@@ -358,51 +365,47 @@ def main():
             logging.error(f"Error creating GPTQConfig: {e}", exc_info=True)
             return
 
-        logging.info(f"Loading model for GPTQ from: {args.model_path} onto CPU")
+        # Set up device map based on args - similar to AWQ but for GPTQ
+        device_map = "auto"  # Default to auto device map
+        max_memory = parse_max_memory(args.max_memory)
+        
+        if gpu_available:
+            if args.cpu_offload:
+                logging.info("CPU offloading enabled for memory efficiency")
+                device_map = "auto"
+            elif max_memory:
+                logging.info(f"Using custom memory limits: {max_memory}")
+                device_map = max_memory
+            else:
+                # Try to auto-determine conservative memory usage
+                # Reserve 2GB of GPU memory for quantization processes
+                free_mem = torch.cuda.mem_get_info(0)[0] / (1024**3)
+                reserve_mem = 2.0  # 2 GB reserve
+                usable_mem = max(free_mem - reserve_mem, free_mem * 0.8)  # Use at most 80% of free memory
+                
+                logging.info(f"Free GPU memory: {free_mem:.2f} GB, using {usable_mem:.2f} GB for model loading")
+                max_memory = {
+                    "cuda:0": f"{usable_mem:.0f}GiB",
+                    "cpu": "64GiB"
+                }
+                device_map = max_memory
+        else:
+            device_map = "cpu"
+        
+        logging.info(f"Loading model for GPTQ from: {args.model_path} with device_map: {device_map}")
         # For GPTQ using transformers, we load the model first and then quantize
         # Device placement is handled by from_pretrained
-        # Force CPU explicitly with string value
-        device_map = "cpu" 
-        logging.info(f"Using device '{device_map}' for CPU GPTQ quantization.")
         
         try:
-            # Ensure no GPU usage for GPTQ
-            torch.cuda.is_available = lambda: False
-            
-            # Add progress tracking for GPTQ
-            start_time = time.time()
-            logging.info(f"GPTQ quantization started at: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-            
-            # Set up a progress checker on a separate thread
-            def log_progress():
-                last_log_time = time.time()
-                while True:
-                    current_time = time.time()
-                    elapsed = current_time - start_time
-                    if current_time - last_log_time >= 300:  # Log every 5 minutes
-                        last_log_time = current_time
-                        logging.info(f"GPTQ quantization still in progress... (Elapsed: {elapsed:.2f} seconds)")
-                        log_memory_usage("during GPTQ quantization")
-                        # Force garbage collection to get accurate memory readings
-                        gc.collect()
-                    time.sleep(60)  # Check every minute
-                    
-            progress_thread = threading.Thread(target=log_progress, daemon=True)
-            progress_thread.start()
-            
-            # Force CPU operations
-            log_memory_usage("before GPTQ model loading")
-            with torch.device('cpu'):
-                model = AutoModelForCausalLM.from_pretrained(
-                    args.model_path,
-                    device_map=device_map, 
-                    trust_remote_code=True,
-                    quantization_config=gptq_config # Pass the config here
-                )
-            
-            elapsed = time.time() - start_time
-            log_memory_usage("after GPTQ quantization")
-            logging.info(f"Model loaded and GPTQ quantization completed in {elapsed:.2f} seconds ({elapsed/60:.2f} minutes).")
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model_path,
+                device_map=device_map,
+                offload_folder="offload", 
+                offload_state_dict=args.cpu_offload,
+                trust_remote_code=True,
+                quantization_config=gptq_config # Pass the config here
+            )
+            logging.info("Model loaded and quantization process initiated via GPTQConfig.")
         except Exception as e:
             logging.error(f"Error loading model or initiating GPTQ quantization: {e}", exc_info=True)
             return
@@ -410,163 +413,25 @@ def main():
         logging.info("GPTQ Quantization completed implicitly during model loading.")
 
         # --- GPTQ Saving --- #
-        # Create a temporary directory for saving first, then move files with suffix
-        temp_dir = tempfile.mkdtemp()
-        logging.info(f"Saving GPTQ quantized model temporarily to: {temp_dir}")
+        # Transformers' save_pretrained handles GPTQ saving
+        output_dir = os.path.join(args.model_path, f"GPTQ_{args.bits}bit_CPU") # Add CPU indication
+        os.makedirs(output_dir, exist_ok=True)
+        logging.info(f"Saving GPTQ quantized model to subdirectory: {output_dir}")
         try:
             # save_pretrained will save the model shards, config with quant info, tokenizer etc.
-            model.save_pretrained(temp_dir, max_shard_size="4GB") # Limit to 4GB for Hugging Face compatibility
-            tokenizer.save_pretrained(temp_dir) 
-            logging.info(f"GPTQ quantized model and tokenizer temporarily saved to {temp_dir}")
+            model.save_pretrained(output_dir)
+            tokenizer.save_pretrained(output_dir) 
+            logging.info(f"GPTQ quantized model and tokenizer saved successfully to {output_dir}")
 
-            # Copy files from temp_dir to original directory with -GPTQ suffix
-            # Identify the model weight files (.safetensors, .bin) and config files
-            model_files = glob.glob(os.path.join(temp_dir, '*.safetensors')) + glob.glob(os.path.join(temp_dir, '*.bin'))
-            config_file = os.path.join(temp_dir, 'config.json')
-            
-            # Copy model files with -GPTQ suffix
-            for file_path in model_files:
-                filename = os.path.basename(file_path)
-                base, ext = os.path.splitext(filename)
-                dest_filename = f"{base}-GPTQ{ext}"
-                dest_path = os.path.join(args.model_path, dest_filename)
-                logging.info(f"Copying {file_path} to {dest_path}")
-                shutil.copy2(file_path, dest_path)
-            
-            # Copy and rename config file
-            if os.path.exists(config_file):
-                dest_path = os.path.join(args.model_path, 'config-GPTQ.json')
-                logging.info(f"Copying config to {dest_path}")
-                shutil.copy2(config_file, dest_path)
-            
-            # Handle index file creation for GPTQ
-            original_index_file = os.path.join(args.model_path, 'model.safetensors.index.json')
-            temp_index_file = os.path.join(temp_dir, 'model.safetensors.index.json')
-            
-            # Build mapping of original files to GPTQ files
-            model_file_mapping = {}
-            for file_path in model_files:
-                filename = os.path.basename(file_path)
-                base, ext = os.path.splitext(filename)
-                dest_filename = f"{base}-GPTQ{ext}"
-                model_file_mapping[filename] = dest_filename
-            
-            # If original index exists, use it as a template
-            if os.path.exists(original_index_file) and model_files:
-                logging.info(f"Creating GPTQ index file based on original index: {original_index_file}")
-                try:
-                    with open(original_index_file, 'r') as f:
-                        index_data = json.load(f)
-                    
-                    # Update the weight map with GPTQ file names
-                    if 'weight_map' in index_data:
-                        new_weight_map = {}
-                        for tensor_name, file_name in index_data['weight_map'].items():
-                            base_name = os.path.basename(file_name)
-                            # Try to find a mapping for this file
-                            matching_new_file = None
-                            for orig_file in model_file_mapping:
-                                # Look for partial matches to handle potential name differences
-                                if orig_file in base_name or base_name in orig_file:
-                                    matching_new_file = model_file_mapping[orig_file]
-                                    break
-                            
-                            if matching_new_file:
-                                new_weight_map[tensor_name] = matching_new_file
-                            else:
-                                # If no match, use pattern replacement
-                                new_weight_map[tensor_name] = file_name.replace(".safetensors", "-GPTQ.safetensors")
-                        
-                        # Update the index data
-                        index_data['weight_map'] = new_weight_map
-                        
-                        # Add GPTQ metadata
-                        if 'metadata' not in index_data:
-                            index_data['metadata'] = {}
-                        index_data['metadata']['gptq_bits'] = args.bits
-                        index_data['metadata']['gptq_group_size'] = args.gptq_group_size
-                        
-                        # Save the new index file
-                        gptq_index_path = os.path.join(args.model_path, "model-GPTQ.safetensors.index.json")
-                        with open(gptq_index_path, 'w') as f:
-                            json.dump(index_data, f, indent=2)
-                        logging.info(f"Created GPTQ index file at {gptq_index_path}")
-                    else:
-                        logging.warning("Original index exists but doesn't have a weight_map. Creating simplified index.")
-                        # Fall back to temp file or create a simple mapping
-                        _create_simple_gptq_index(temp_index_file, args, model_files, model_file_mapping)
-                except Exception as e:
-                    logging.error(f"Error creating GPTQ index file: {e}", exc_info=True)
-                    # Fall back to simple creation
-                    _create_simple_gptq_index(temp_index_file, args, model_files, model_file_mapping)
-            # If temp index exists, try to use it
-            elif os.path.exists(temp_index_file):
-                logging.info(f"Using GPTQ-generated index file as base")
-                try:
-                    with open(temp_index_file, 'r') as f:
-                        index_data = json.load(f)
-                    
-                    # Add GPTQ metadata
-                    if 'metadata' not in index_data:
-                        index_data['metadata'] = {}
-                    index_data['metadata']['gptq_bits'] = args.bits
-                    index_data['metadata']['gptq_group_size'] = args.gptq_group_size
-                    
-                    # Update weight map if it exists
-                    if 'weight_map' in index_data:
-                        new_weight_map = {}
-                        for tensor_name, file_name in index_data['weight_map'].items():
-                            new_weight_map[tensor_name] = file_name.replace(".safetensors", "-GPTQ.safetensors")
-                        index_data['weight_map'] = new_weight_map
-                    
-                    # Save the modified index file
-                    gptq_index_path = os.path.join(args.model_path, "model-GPTQ.safetensors.index.json")
-                    with open(gptq_index_path, 'w') as f:
-                        json.dump(index_data, f, indent=2)
-                    logging.info(f"Created GPTQ index file from temp index at {gptq_index_path}")
-                except Exception as e:
-                    logging.error(f"Error processing temp GPTQ index file: {e}", exc_info=True)
-                    # Fall back to simple creation
-                    _create_simple_gptq_index(temp_index_file, args, model_files, model_file_mapping)
-            # Otherwise create a simple index from scratch if we have multiple files
-            elif len(model_files) > 1:
-                _create_simple_gptq_index(None, args, model_files, model_file_mapping)
+            custom_code_files = glob.glob(os.path.join(args.model_path, '*.py'))
+            if custom_code_files:
+                logging.info(f"Copying custom code files to {output_dir}: {custom_code_files}")
+                for py_file in custom_code_files:
+                     shutil.copy2(py_file, output_dir)
 
-# Helper function to create a simple GPTQ index
-def _create_simple_gptq_index(temp_index_file, args, model_files, model_file_mapping):
-    """Helper method to create a simplified GPTQ index file"""
-    # Create a simple index for GPTQ
-    index_data = {"metadata": {"gptq_bits": args.bits, "gptq_group_size": args.gptq_group_size}}
-    weight_map = {}
-    
-    for orig_file, gptq_file in model_file_mapping.items():
-        # Create a simple placeholder mapping with file names as tensor names
-        # This is not ideal but better than nothing
-        weight_map[f"tensor_{orig_file}"] = gptq_file
-    
-    index_data["weight_map"] = weight_map
-    
-    # Save the index file
-    index_path = os.path.join(args.model_path, "model-GPTQ.safetensors.index.json")
-    with open(index_path, 'w') as f:
-        json.dump(index_data, f, indent=2)
-    logging.info(f"Created simplified GPTQ index file at {index_path}")
-
-            # Copy any custom code files if they exist
-            custom_code_files = glob.glob(os.path.join(temp_dir, '*.py'))
-            for py_file in custom_code_files:
-                py_filename = os.path.basename(py_file)
-                dest_path = os.path.join(args.model_path, f"{py_filename[:-3]}-GPTQ.py")
-                logging.info(f"Copying custom code file to {dest_path}")
-                shutil.copy2(py_file, dest_path)
-
-            logging.info(f"Successfully saved GPTQ files to {args.model_path} with -GPTQ suffix")
         except Exception as e:
             logging.error(f"Error during GPTQ model saving: {e}", exc_info=True)
             return
-        finally:
-            logging.info(f"Cleaning up temporary directory: {temp_dir}")
-            shutil.rmtree(temp_dir)
 
     else:
         # This case should not be reachable due to the default logic

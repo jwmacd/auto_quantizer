@@ -1,5 +1,5 @@
-# Use a base image with Python (CPU only)
-FROM python:3.10-slim
+# Use a base image with Python and CUDA support (PyTorch 2.3.0 / CUDA 12.1)
+FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
 
 # Set the working directory in the container
 WORKDIR /app
@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git && \
         accelerate~=0.30.0 \
         safetensors \
         psutil \
+        datasets \
         huggingface_hub[hf_xet] && \
     apt-get purge -y --auto-remove git && \
     rm -rf /var/lib/apt/lists/*
@@ -24,7 +25,7 @@ COPY requirements.txt /app/
 
 # Install Python dependencies
 # Use --no-cache-dir to reduce image size
-RUN pip install --no-cache-dir -r /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
 
 # Copy the quantization script into the container
 COPY quantize.py /app/
