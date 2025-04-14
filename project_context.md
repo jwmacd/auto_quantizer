@@ -2,37 +2,43 @@
 
 ## Project Overview
 
-This project provides a Dockerized environment for quantizing large language models using either the AWQ (Activation-aware Weight Quantization) method (4-bit) or the GPTQ method (8-bit). It aims to simplify the quantization workflow, particularly for users with capable hardware (significant CPU RAM and modern GPUs). It supports both CPU-only execution (via `--force_cpu`) and GPU-accelerated quantization using `accelerate`'s explicit CPU offload (`cpu_offload`) for efficient memory management on single-GPU setups. A key feature is its ability to handle GPTQ quantization for models with extremely long context lengths (e.g., 128k) by temporarily modifying the model configuration during calibration to use a shorter sequence length, thus avoiding common out-of-memory errors.
+This project provides a Dockerized environment for quantizing large language models using AWQ (typically 4-bit) or GPTQ (typically 8-bit) methods. It aims to simplify the quantization workflow by providing a unified command-line interface and encapsulating dependencies.
 
-**Important Note:** Quantizing large language models (especially 60GB+ or using GPTQ) is inherently resource-intensive. This tool automates several complex steps but does not eliminate the need for substantial CPU RAM (potentially ~1.5x the original model size during peak quantization) and GPU VRAM (even with offloading). It is best suited for users who understand these requirements and possess hardware capable of meeting them.
+A core design principle is **memory efficiency** for single-GPU setups. This is achieved by:
+*   Loading the base model initially to CPU RAM (`device_map="cpu"`).
+*   Providing control over the calibration sequence length (`--seq_len`) to manage peak VRAM usage during quantization.
+*   Logging peak VRAM usage for monitoring and tuning.
+
+This tool is primarily intended for users who need to quantize custom models locally and possess hardware with sufficient CPU RAM and GPU VRAM for the chosen model and method.
 
 ## Architecture
 
-- **Docker Container:** Encapsulates all dependencies (`transformers`, `autoawq`, `optimum[auto-gptq]`, `torch`, `accelerate`, `datasets`, etc.) and the quantization script.
-- **Quantization Script (`quantize.py`):** Python script that handles model loading, quantization logic, and saving. Uses command-line flags (`--awq` or `--gptq`) for method selection. Implements explicit CPU offload via `accelerate.cpu_offload` when a GPU is detected (and not overridden by `--force_cpu`). For GPTQ, it includes logic to temporarily modify the model's sequence length configuration (`max_position_embeddings` or similar) based on the `--seq_len` argument to manage memory during calibration, restoring the original value before saving.
-- **Execution:** Runs on GPU by default if available, leveraging CPU RAM for offloading model layers not currently in computation. Can be forced to run entirely on CPU using `--force_cpu`.
-- **Input/Output:** Mounts a host directory containing the pre-trained model into the container (`/models`). Creates a new subdirectory within the mounted path named `<original_model_name>-AWQ` or `<original_model_name>-GPTQ`. Saves quantized outputs (weights, configs, index file, custom code) *inside this subdirectory*, with filenames also having the corresponding `-AWQ` or `-GPTQ` suffix.
+- **Docker Container:** Encapsulates Python, PyTorch, CUDA (if applicable), quantization libraries (`autoawq`, `optimum[auto-gptq]`), `transformers`, `accelerate`, and other dependencies.
+- **Quantization Script (`quantize.py`):** The main entry point. Parses arguments, determines the execution device (GPU preferred, CPU fallback), loads the model using `device_map="cpu"`, orchestrates the selected quantization process (AWQ or GPTQ) applying the `--seq_len` parameter, monitors peak VRAM, and saves the results.
+- **VRAM Monitoring (`utils/vram_monitor.py`):** A utility class run in a background thread to track peak GPU memory usage during quantization.
+- **Execution:** Runs on an available NVIDIA GPU by default. Can be forced to run entirely on CPU using `--force_cpu`. The quantization libraries handle internal layer processing on the target device.
+- **Input/Output:** Expects a host directory containing the pre-trained model mounted into the container at `/models`. Creates a new subdirectory named `METHOD-BITRATE` (e.g., `AWQ-4bit`, `GPTQ-8bit`) within the input model directory and saves the quantized model, tokenizer files, configuration, and `quantization_report.log` there.
 
 ## Key Components
 
-- **`Dockerfile`:** Defines the Docker image build process, including dependency installation and setting `TORCH_CUDA_ARCH_LIST` for potentially faster CUDA kernels.
+- **`Dockerfile`:** Defines the Docker image, installing dependencies from `requirements.txt`.
 - **`requirements.txt`:** Lists Python package dependencies.
-- **`quantize.py`:** The core script. Parses arguments (model path, method flags, bits, `--seq_len`, `--force_cpu`, etc.), loads model/tokenizer, determines execution device, applies explicit CPU offload if using GPU, performs AWQ or GPTQ (including the sequence length config modification/restoration for GPTQ), and saves outputs with suffixes.
-- **`README.md`:** Provides usage instructions, build steps, examples, and troubleshooting tips, focusing on the sequence length workaround for large context models.
-- **`project_context.md`:** (This file) Overview of the project architecture and approach.
+- **`quantize.py`:** The core quantization script handling argument parsing, model loading (`device_map="cpu"`), AWQ/GPTQ execution logic (using `--seq_len`), VRAM monitoring invocation, and saving results to the `METHOD-BITRATE` directory.
+- **`utils/vram_monitor.py`:** Contains the `VRAMMonitor` class for peak memory tracking.
+- **`README.md`:** User-facing documentation covering setup, usage, examples, command-line arguments, memory considerations, and troubleshooting.
+- **`historyandstatus.md`:** Internal development log tracking history, decisions, status, and next steps.
+- **`project_context.md`:** (This file) High-level static overview of the project architecture, components, and conventions.
 
 ## Conventions
 
-- AWQ default: 4-bit, group size 128, zero point true.
-- GPTQ default: 8-bit, wikitext2 dataset, group size 128.
-- Method selection via mutually exclusive flags: `--awq` (default) or `--gptq`.
-- Execution device determined automatically (GPU if available), override with `--force_cpu`.
-- Explicit CPU offload used when running on GPU.
-- Sequence length for calibration controlled by `--seq_len` (default 8192), crucial for GPTQ on large-context models.
-- Output files (weights, relevant configs) for both AWQ and GPTQ are saved with suffixes (`-AWQ` or `-GPTQ`) in the original model directory.
-- Output files for both AWQ and GPTQ are saved inside a new subdirectory `<original_model_name>-AWQ` or `<original_model_name>-GPTQ` within the original model path.
-- Filenames within the output subdirectory also have the corresponding `-AWQ` or `-GPTQ` suffix applied (e.g., `model-AWQ.safetensors`).
-- Logging to both console and `quantize.log` file within the container (path relative to where the script is run inside the container).
+- AWQ default: 4-bit.
+- GPTQ default: 8-bit.
+- Default calibration sequence length (`--seq_len`): 2048.
+- Method selection via mutually exclusive flags: `--awq` (default if neither specified) or `--gptq`.
+- Execution device determined automatically (GPU preferred), override with `--force_cpu`.
+- Base model loading uses `device_map="cpu"` strategy.
+- Output is saved in a subdirectory named `METHOD-BITRATE` (e.g., `AWQ-4bit`, `GPTQ-8bit`) inside the input model directory.
+- Peak VRAM usage is logged to `quantization_report.log` within the output subdirectory.
 
 ## Dependencies
 

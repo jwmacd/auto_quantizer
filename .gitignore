@@ -28,5 +28,9 @@ quantized_models/
 .DS_Store
 Thumbs.db
 
+# Internal development logs
+# historyandstatus.md # Renamed
+devlog.md
+
 # Custom build/helper scripts
 build_and_push.ps1
