@@ -27,3 +27,6 @@ quantized_models/
 # OS specific
 .DS_Store
 Thumbs.db
+
+# Custom build/helper scripts
+build_and_push.ps1
