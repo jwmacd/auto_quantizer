@@ -11,6 +11,16 @@ from awq import AutoAWQForCausalLM
 from transformers import AutoModelForCausalLM, GPTQConfig, AutoTokenizer, AutoConfig
 from datasets import load_dataset
 import logging
+# Attempt to import exllamav2 - allows script to run even if not built/installed
+try:
+    from exllamav2 import ExLlamaV2
+    from exllamav2.config import ExLlamaV2Config
+    from exllamav2.data import ExLlamaV2Dataset
+    from exllamav2.quantize import ExLlamaV2Quantizer
+    EXLLAMA_V2_AVAILABLE = True
+except ImportError:
+    logging.warning("exllamav2 library not found. EXL2 quantization will not be available.")
+    EXLLAMA_V2_AVAILABLE = False
 
 # --- Helper Function for Memory Logging ---
 def log_gpu_memory_usage(stage="", device="cuda:0"):
@@ -61,10 +71,12 @@ def parse_arguments():
                               help='Use AWQ quantization (4-bit). This is the default if neither --awq nor --gptq is specified.')
     method_group.add_argument('--gptq', action='store_true',
                               help='Use GPTQ quantization (8-bit). WARNING: Very slow on CPU.')
+    method_group.add_argument('--exl2', action='store_true',
+                              help='Use EXL2 quantization (requires exllamav2 library). Specify target bits per weight with --exl2_bpw.')
 
     # Bits argument - default depends on the selected method later
     parser.add_argument('--bits', type=int,
-                        help='Number of bits for quantization (Default: 4 for AWQ, 8 for GPTQ).')
+                        help='Number of bits for quantization (AWQ/GPTQ only). Default: 4 for AWQ, 8 for GPTQ.')
     
     # General quantization config override
     parser.add_argument('--quant_config', type=str, default='{}',
@@ -92,12 +104,37 @@ def parse_arguments():
     parser.add_argument('--gptq_desc_act', action='store_true', default=False,
                          help='Use descending activation order for GPTQ (sometimes improves accuracy). Default: False')
 
+    # --- EXL2 Specific Arguments --- #
+    exl2_group = parser.add_argument_group('EXL2 Specific Arguments')
+    exl2_group.add_argument('--exl2_bpw', type=float, default=4.0,
+                           help='Target bits per weight for EXL2 quantization. Default: 4.0')
+    exl2_group.add_argument('--exl2_cal_dataset', type=str, default=None,
+                           help='Path to calibration dataset file for EXL2 (e.g., calibration_data.parquet). Required for EXL2.')
+    exl2_group.add_argument('--exl2_cal_rows', type=int, default=100,
+                            help='Number of rows from dataset to use for calibration. Default: 100')
+    exl2_group.add_argument('--exl2_measurement', type=str, default=None,
+                           help='Path to load/save measurement JSON file for EXL2 calibration. If exists, loads; otherwise, saves after measurement.')
+    exl2_group.add_argument('--exl2_head_bits', type=int, default=6,
+                           help='Number of bits for head layers in EXL2. Default: 6')
+    # Add other EXL2 options as needed, e.g., shard size, overlap, rope scale/alpha?
+
     args = parser.parse_args()
 
     # Default to AWQ if neither flag is set
-    if not args.awq and not args.gptq:
+    if not args.awq and not args.gptq and not args.exl2:
         args.awq = True
-        logging.info("Neither --awq nor --gptq specified, defaulting to AWQ.")
+        logging.info("Neither --awq, --gptq, nor --exl2 specified, defaulting to AWQ.")
+
+    # Validate EXL2 prerequisites if selected
+    if args.exl2:
+        if not EXLLAMA_V2_AVAILABLE:
+            logging.error("EXL2 quantization selected, but the exllamav2 library is not installed or importable.")
+            # Optionally exit here or let it fail later
+            parser.error("exllamav2 library required for --exl2")
+        if args.exl2_cal_dataset is None:
+            parser.error("--exl2_cal_dataset is required when using --exl2")
+        if not os.path.exists(args.exl2_cal_dataset):
+             parser.error(f"EXL2 calibration dataset not found: {args.exl2_cal_dataset}")
 
     return args
 
@@ -113,14 +150,27 @@ def main():
     logging.info(f"Starting quantization process with args: {args}")
 
     # Determine method and set default bits
-    quantization_method = "awq" if args.awq else "gptq"
-    if args.bits is None:
+    if args.awq:
+        quantization_method = "awq"
+    elif args.gptq:
+        quantization_method = "gptq"
+    elif args.exl2:
+        quantization_method = "exl2"
+    else: # Should be unreachable due to default logic
+        quantization_method = "awq"
+
+    # Set default bits only for AWQ/GPTQ
+    if args.bits is None and quantization_method in ["awq", "gptq"]:
         if quantization_method == 'awq':
             args.bits = 4
         else: # gptq
             args.bits = 8
     
-    logging.info(f"Selected method: {quantization_method.upper()}, Bits: {args.bits}")
+    # Log method and appropriate bits
+    if quantization_method == "exl2":
+        logging.info(f"Selected method: {quantization_method.upper()}, Target BPW: {args.exl2_bpw}")
+    else:
+        logging.info(f"Selected method: {quantization_method.upper()}, Bits: {args.bits}")
 
     # --- Determine Execution Device --- #
     if args.force_cpu:
@@ -139,6 +189,9 @@ def main():
 
     if quantization_method == 'gptq' and execution_device == 'cpu':
         logging.warning("GPTQ on CPU is EXTREMELY slow.")
+    if quantization_method == 'exl2' and execution_device == 'cpu':
+        logging.error("EXL2 quantization requires a GPU.")
+        return
 
     # Validate bits per method
     if quantization_method == 'awq' and args.bits != 4:
@@ -149,11 +202,14 @@ def main():
         return
 
     # Load custom quant_config if provided
-    try:
-        custom_config = json.loads(args.quant_config)
-    except json.JSONDecodeError:
-        logging.error(f"Invalid JSON string provided for --quant_config: {args.quant_config}")
-        custom_config = {}
+    custom_config = {}
+    if quantization_method != 'exl2': # EXL2 uses its own config params
+        try:
+            custom_config = json.loads(args.quant_config)
+        except json.JSONDecodeError:
+            logging.error(f"Invalid JSON string provided for --quant_config: {args.quant_config}")
+            # Reset to empty dict if invalid, default logic will handle method defaults
+            custom_config = {}
 
     # --- Load Tokenizer (Common Step) --- #
     logging.info(f"Loading tokenizer from: {args.model_path}")
@@ -569,6 +625,103 @@ def main():
         finally:
             logging.info(f"Cleaning up temporary directory: {temp_dir}")
             shutil.rmtree(temp_dir)
+
+    elif quantization_method == 'exl2':
+        # --- EXL2 Quantization --- # 
+        if not EXLLAMA_V2_AVAILABLE: # Double check, though parser should have caught it
+             logging.error("Cannot perform EXL2 quantization, exllamav2 library not available.")
+             return
+
+        logging.info(f"Starting EXL2 quantization for model: {args.model_path}")
+        logging.info(f"Target BPW: {args.exl2_bpw}, Head Bits: {args.exl2_head_bits}")
+        logging.info(f"Calibration Dataset: {args.exl2_cal_dataset}, Rows: {args.exl2_cal_rows}")
+        if args.exl2_measurement:
+            logging.info(f"Measurement file path: {args.exl2_measurement}")
+
+        # Define output directory for EXL2
+        output_suffix = f"EXL2_{args.exl2_bpw:.2f}bpw" # More descriptive suffix
+        base_model_name = os.path.basename(args.model_path.rstrip('/'))
+        output_subdir_name = f"{base_model_name}-{output_suffix}"
+        output_dir = os.path.join(args.model_path, output_subdir_name)
+        logging.info(f"EXL2 output directory: {output_dir}")
+        os.makedirs(output_dir, exist_ok=True)
+
+        try:
+            # 1. Create config
+            config = ExLlamaV2Config()
+            config.model_dir = args.model_path
+            config.prepare()
+            # Note: Exllama determines max_seq_len from model config, might need override if original is huge
+            # If args.seq_len is provided and lower than config, consider using it?
+            effective_cal_seq_len = config.max_seq_len
+            if args.seq_len < config.max_seq_len:
+                 logging.warning(f"Requested --seq_len {args.seq_len} is less than model's max {config.max_seq_len}. "
+                                 f"Using {args.seq_len} for calibration dataset sequence length.")
+                 effective_cal_seq_len = args.seq_len
+            else:
+                 logging.info(f"Using model's max sequence length ({config.max_seq_len}) for calibration dataset.")
+
+            logging.info("EXL2 config prepared.")
+
+            # 2. Prepare quantizer
+            quantizer = ExLlamaV2Quantizer(config)
+            quantizer.output_dir = output_dir
+
+            # 3. Load/Run measurement
+            measurement_path = args.exl2_measurement
+            if measurement_path and os.path.exists(measurement_path):
+                logging.info(f"Loading measurement data from: {measurement_path}")
+                quantizer.load_measurement(measurement_path)
+            else:
+                logging.info("Performing measurement...")
+                # Prepare dataset using the determined sequence length
+                dataset = ExLlamaV2Dataset(config,
+                                         args.exl2_cal_dataset,
+                                         seq_len = effective_cal_seq_len, 
+                                         rows = args.exl2_cal_rows)
+
+                quantizer.measure(dataset)
+                if measurement_path:
+                    logging.info(f"Saving measurement data to: {measurement_path}")
+                    quantizer.save_measurement(measurement_path)
+                else:
+                    logging.info("Measurement done. Not saving (no --exl2_measurement path specified).")
+            
+            # 4. Run quantization
+            logging.info(f"Starting quantization job (Target BPW: {args.exl2_bpw})...")
+            # Define quantization arguments based on parameters
+            quant_args = {
+                "target_bpw": args.exl2_bpw,
+                "head_bits": args.exl2_head_bits,
+                # Add other potential args like shard_size, overlap etc. if needed
+            }
+            quantizer.quantize(**quant_args)
+            logging.info("EXL2 quantization finished successfully.")
+            logging.info(f"Output saved to: {output_dir}")
+
+            # 5. Copy tokenizer files (optional but recommended for usability)
+            logging.info("Copying tokenizer files to EXL2 output directory...")
+            try:
+                 tokenizer_files = glob.glob(os.path.join(args.model_path, 'tokenizer*')) + \
+                                   glob.glob(os.path.join(args.model_path, 'special_tokens_map.json')) + \
+                                   glob.glob(os.path.join(args.model_path, 'vocab.*')) # Include vocab files if separate
+                 for file_path in tokenizer_files:
+                      filename = os.path.basename(file_path)
+                      dest_path = os.path.join(output_dir, filename)
+                      if not os.path.exists(dest_path): # Avoid overwriting if somehow present
+                           logging.debug(f"Copying {filename} to {output_dir}")
+                           shutil.copy2(file_path, dest_path)
+                 logging.info("Tokenizer files copied.")
+            except Exception as e:
+                 logging.warning(f"Could not copy tokenizer files to EXL2 output directory: {e}", exc_info=True)
+
+        except Exception as e:
+            logging.error(f"Error during EXL2 quantization: {e}", exc_info=True)
+            # Optional: Clean up output dir on failure?
+            # if os.path.exists(output_dir):
+            #     logging.info(f"Cleaning up partially created EXL2 output dir: {output_dir}")
+            #     shutil.rmtree(output_dir)
+            return
 
     else:
         # This case should not be reachable due to the default logic

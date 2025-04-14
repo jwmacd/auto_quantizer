@@ -8,3 +8,4 @@ auto-gptq>=0.7.0 # Explicitly add auto-gptq
 datasets>=2.14.0
 psutil>=5.9.0
 huggingface_hub[hf_xet]
+# exllamav2 # Installed directly from git in Dockerfile

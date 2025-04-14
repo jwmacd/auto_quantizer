@@ -20,6 +20,14 @@ RUN pip install --no-cache-dir \
     git+https://github.com/casper-hansen/AutoAWQ.git && \
     pip install --no-cache-dir -r /app/requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
 
+# 3. Install ExLlamaV2 from GitHub (includes CUDA extensions)
+# Note: ExLlamaV2 setup.py might automatically detect CUDA/Arch, TORCH_CUDA_ARCH_LIST may still be relevant
+RUN git clone https://github.com/turboderp/exllamav2.git /app/exllamav2_repo && \
+    cd /app/exllamav2_repo && \
+    pip install --no-cache-dir -e . && \
+    cd /app && \
+    rm -rf /app/exllamav2_repo
+
 # Clean up git after installation (optional, reduces image size slightly)
 # RUN apt-get purge -y --auto-remove git && apt-get clean
 
