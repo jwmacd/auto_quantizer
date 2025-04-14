@@ -12,6 +12,18 @@ from transformers import AutoModelForCausalLM, GPTQConfig, AutoTokenizer, AutoCo
 from datasets import load_dataset
 import logging
 
+# --- Helper Function for Memory Logging ---
+def log_gpu_memory_usage(stage="", device="cuda:0"):
+    if torch.cuda.is_available() and device.startswith("cuda"):
+        try:
+            allocated = torch.cuda.memory_allocated(device) / (1024**3)
+            reserved = torch.cuda.memory_reserved(device) / (1024**3)
+            logging.info(f"GPU Memory ({stage}) on {device}: Allocated={allocated:.2f} GB, Reserved={reserved:.2f} GB")
+        except Exception as e:
+            logging.error(f"Could not get GPU memory stats: {e}")
+    else:
+        logging.info(f"GPU Memory ({stage}): Not using GPU or CUDA not available.")
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -66,10 +78,10 @@ def parse_arguments():
     # --- AWQ Specific Arguments (Calibration) --- 
     parser.add_argument('--batch_size', type=int, default=1,
                         help='Batch size for AWQ quantization calibration. Default: 1')
-    parser.add_argument('--seq_len', type=int, default=2048, # Reduced default for safety
+    parser.add_argument('--seq_len', type=int, default=8192, # Reduced default for safety
                         help='Maximum sequence length to use for calibration data (AWQ & GPTQ). '
                              'Reduces memory usage during quantization, especially for models with '
-                             'very long context windows. Default: 2048')
+                             'very long context windows. Default: 8192')
 
 
     # --- GPTQ Specific Arguments --- #
@@ -204,7 +216,13 @@ def main():
         # --- AWQ Saving --- #
         output_suffix = "AWQ"
         temp_dir = tempfile.mkdtemp()
-        logging.info(f"Saving AWQ quantized model temporarily before moving to: {args.model_path}")
+        # Define final output subdirectory
+        base_model_name = os.path.basename(args.model_path.rstrip('/'))
+        output_subdir_name = f"{base_model_name}-{output_suffix}"
+        output_dir = os.path.join(args.model_path, output_subdir_name)
+        logging.info(f"Saving AWQ quantized model temporarily, final destination: {output_dir}")
+        os.makedirs(output_dir, exist_ok=True)
+        logging.info(f"Ensured output directory exists: {output_dir}")
         logging.info(f"Using temporary directory: {temp_dir}")
         try:
             # Use a potentially smaller shard size if memory is constrained? Default 4GB is usually fine.
@@ -226,26 +244,26 @@ def main():
                 # This might be expected if the model isn't sharded
                 logging.info(f"Index file not found in temp dir (model might not be sharded): {index_file_temp}")
 
-            logging.info(f"Copying {len(files_to_copy)} AWQ files from temp dir to {args.model_path}")
+            logging.info(f"Copying {len(files_to_copy)} AWQ files from temp dir to {output_dir}")
             for file_path in files_to_copy:
                 filename = os.path.basename(file_path)
                 # Add -AWQ suffix to safetensors and config files
+                dest_filename = filename # Default to original name
                 if filename.endswith('.safetensors') and not filename.startswith('model'):
                     # Handle potential non-model safetensors if any? Unlikely.
-                    dest_filename = f"{filename[:-len('.safetensors')]}-AWQ.safetensors"
+                    dest_filename = f"{filename[:-len('.safetensors')]}-{output_suffix}.safetensors"
                 elif filename.startswith('model') and filename.endswith('.safetensors'):
-                    dest_filename = filename.replace(".safetensors", "-AWQ.safetensors")
+                    dest_filename = filename.replace(".safetensors", f"-{output_suffix}.safetensors")
                 elif filename == 'quant_config.json':
-                    dest_filename = "quant_config-AWQ.json"
+                    dest_filename = f"quant_config-{output_suffix}.json"
                 elif filename == 'model.safetensors.index.json':
-                     dest_filename = "model-AWQ.safetensors.index.json"
-                else:
-                     logging.warning(f"Unexpected file found in AWQ temp directory: {filename}. Copying as-is.")
-                     dest_filename = filename 
+                    dest_filename = f"model-{output_suffix}.safetensors.index.json"
+                # else: Keep original filename if unexpected
 
-                dest_path = os.path.join(args.model_path, dest_filename)
+                # Destination path is inside the output subdirectory
+                dest_path = os.path.join(output_dir, dest_filename)
                 if os.path.exists(dest_path):
-                     logging.warning(f"Destination file {dest_path} already exists. Overwriting.") 
+                    logging.warning(f"Destination file {dest_path} already exists. Overwriting.")
 
                 logging.debug(f"Copying {file_path} to {dest_path}")
                 shutil.copy2(file_path, dest_path) 
@@ -256,11 +274,13 @@ def main():
                 logging.info(f"Found {len(custom_code_files)} custom Python files to copy")
                 for py_file in custom_code_files:
                     py_filename = os.path.basename(py_file)
-                    dest_path = os.path.join(args.model_path, f"{py_filename[:-3]}-AWQ.py") # Add suffix
-                    logging.info(f"Copying custom code file to {dest_path}")
+                    # Add suffix to python file and save in subdirectory
+                    dest_filename = f"{py_filename[:-3]}-{output_suffix}.py"
+                    dest_path = os.path.join(output_dir, dest_filename)
+                    logging.info(f"Copying custom code file {py_filename} to {dest_path}")
                     shutil.copy2(py_file, dest_path)
 
-            logging.info(f"Successfully copied AWQ files to {args.model_path}")
+            logging.info(f"Successfully copied AWQ files to {output_dir}")
         except Exception as e:
             logging.error(f"Error during AWQ model saving/copying: {e}", exc_info=True)
         finally:
@@ -343,11 +363,25 @@ def main():
             if modified_config:
                  model_load_kwargs["config"] = modified_config
 
+            # --- Log memory before quantization and reset peak counter ---
+            log_gpu_memory_usage("Before GPTQ Model Load/Quantization", execution_device)
+            if use_gpu_offload:
+                torch.cuda.reset_peak_memory_stats(execution_device)
+                logging.info(f"Reset peak memory stats for {execution_device}.")
+            # -------------------------------------------------------------
+
             model = AutoModelForCausalLM.from_pretrained(
                 args.model_path,
                 **model_load_kwargs
             )
             logging.info(f"Model loaded onto CPU. Quantization implicitly handled via GPTQConfig during load.")
+
+            # --- Log memory after quantization, including peak ---
+            if use_gpu_offload:
+                 peak_reserved = torch.cuda.max_memory_reserved(execution_device) / (1024**3)
+                 logging.info(f"Peak GPU Memory Reserved during GPTQ Load/Quantization on {execution_device}: {peak_reserved:.2f} GB")
+            log_gpu_memory_usage("After GPTQ Model Load/Quantization", execution_device)
+            # --------------------------------------------------------
 
             # --- Restore Original Sequence Length in Model's Config Object (In-Memory) ---
             # Important: Restore it *after* quantization but *before* saving,
@@ -366,11 +400,19 @@ def main():
 
 
             # Apply explicit CPU offload if using GPU *after* initial load/quantization
+            # ---- REMOVED CPU OFFLOAD CALL ----
+            # The quantized model exists entirely in CPU RAM at this point.
+            # Applying cpu_offload requires moving parts to GPU, which caused OOM.
+            # Since we only need to save the model, we can skip this step.
+            # if use_gpu_offload:
+            #     logging.info(f"Applying accelerate explicit CPU offload to target device {execution_device}")
+            #     log_gpu_memory_usage("Before Explicit CPU Offload", execution_device) # Log before offload
+            #     # Offload buffers might be needed depending on model structure?
+            #     cpu_offload(model, execution_device=execution_device, offload_buffers=False)
+            #     logging.info("Explicit CPU offload applied for GPTQ.")
+            #     log_gpu_memory_usage("After Explicit CPU Offload", execution_device) # Log after offload
             if use_gpu_offload:
-                logging.info(f"Applying accelerate explicit CPU offload to target device {execution_device}")
-                # Offload buffers might be needed depending on model structure?
-                cpu_offload(model, execution_device=execution_device, offload_buffers=False)
-                logging.info("Explicit CPU offload applied for GPTQ.")
+                logging.info(f"Skipping explicit CPU offload after quantization to prevent potential OOM during saving.")
             elif execution_device == "cpu":
                  logging.info("Running GPTQ on CPU without offload.")
 
@@ -379,8 +421,15 @@ def main():
             return
 
         # --- GPTQ Saving --- #
+        output_suffix = "GPTQ"
         temp_dir = tempfile.mkdtemp()
-        logging.info(f"Saving GPTQ quantized model temporarily to: {temp_dir}")
+        # Define final output subdirectory
+        base_model_name = os.path.basename(args.model_path.rstrip('/'))
+        output_subdir_name = f"{base_model_name}-{output_suffix}"
+        output_dir = os.path.join(args.model_path, output_subdir_name)
+        logging.info(f"Saving GPTQ quantized model temporarily to: {temp_dir}, final destination: {output_dir}")
+        os.makedirs(output_dir, exist_ok=True)
+        logging.info(f"Ensured output directory exists: {output_dir}")
         try:
             model.save_pretrained(temp_dir, max_shard_size="4GB") 
             tokenizer.save_pretrained(temp_dir) 
@@ -437,31 +486,38 @@ def main():
                 logging.warning(f"Config file 'config.json' not found in temp directory {temp_dir}. Cannot restore sequence length.")
             # --- End Config Restoration ---
 
-            logging.info(f"Copying {len(files_to_copy)} GPTQ-related files from temp dir to {args.model_path}")
+            logging.info(f"Copying {len(files_to_copy)} GPTQ-related files from temp dir to {output_dir}")
             
-            # Prepare for index file creation
+            # Prepare for index file creation - maps original temp name to final suffixed name
             weight_map = {}
-            copied_model_files = []
+            copied_model_files = [] # Stores final suffixed filenames
 
             for file_path in files_to_copy:
                 filename = os.path.basename(file_path)
-                dest_filename = filename # Default
+                dest_filename = filename # Default name in the final directory
 
                 # Add -GPTQ suffix to model weights and config
-                if filename in [os.path.basename(f) for f in model_files]:
+                # Determine the final suffixed filename
+                is_model_weight = filename in [os.path.basename(f) for f in model_files]
+                is_config = filename == 'config.json'
+                is_tokenizer = filename in [os.path.basename(f) for f in tokenizer_files]
+
+                if is_model_weight:
                     base, ext = os.path.splitext(filename)
-                    dest_filename = f"{base}-GPTQ{ext}"
-                    weight_map[filename] = dest_filename # Map original name to new suffixed name for index
+                    dest_filename = f"{base}-{output_suffix}{ext}"
+                    weight_map[filename] = dest_filename # Map temp name to final suffixed name
                     copied_model_files.append(dest_filename)
-                elif filename == 'config.json':
-                    dest_filename = 'config-GPTQ.json'
-                # Keep tokenizer files as they are (no suffix needed)
-                elif filename in [os.path.basename(f) for f in tokenizer_files]:
-                     dest_filename = filename 
+                elif is_config:
+                    dest_filename = f'config-{output_suffix}.json'
+                elif is_tokenizer:
+                     dest_filename = filename # Keep tokenizer files as they are
                 else:
                      logging.warning(f"Unexpected file found in GPTQ temp directory: {filename}. Copying as-is.")
+                     # Keep original name if unexpected
+                     dest_filename = filename 
 
-                dest_path = os.path.join(args.model_path, dest_filename)
+                # Destination path is inside the output subdirectory
+                dest_path = os.path.join(output_dir, dest_filename)
                 if os.path.exists(dest_path):
                     logging.warning(f"Destination file {dest_path} already exists. Overwriting.")
                 
@@ -483,7 +539,8 @@ def main():
                      "weight_map": weight_map # Use the map created during copy
                 }
                 
-                index_path = os.path.join(args.model_path, "model-GPTQ.safetensors.index.json")
+                # Save index file with suffix in the output directory
+                index_path = os.path.join(output_dir, f"model-{output_suffix}.safetensors.index.json")
                 try:
                     with open(index_path, 'w') as f:
                         json.dump(index_data, f, indent=2)
@@ -499,20 +556,19 @@ def main():
             custom_code_files = glob.glob(os.path.join(temp_dir, '*.py'))
             for py_file in custom_code_files:
                 py_filename = os.path.basename(py_file)
-                dest_path = os.path.join(args.model_path, f"{py_filename[:-3]}-GPTQ.py") # Add suffix
-                logging.info(f"Copying custom code file to {dest_path}")
+                # Add suffix to python file and save in subdirectory
+                dest_filename = f"{py_filename[:-3]}-{output_suffix}.py"
+                dest_path = os.path.join(output_dir, dest_filename)
+                logging.info(f"Copying custom code file {py_filename} to {dest_path}")
                 shutil.copy2(py_file, dest_path)
 
-            logging.info(f"Successfully saved GPTQ files to {args.model_path} with -GPTQ suffix")
+            logging.info(f"Successfully saved GPTQ files to {output_dir} with -{output_suffix} suffix")
         except Exception as e:
             logging.error(f"Error during GPTQ model saving/copying: {e}", exc_info=True)
             # Don't return here, proceed to finally
         finally:
             logging.info(f"Cleaning up temporary directory: {temp_dir}")
             shutil.rmtree(temp_dir)
-            if use_gpu_offload and execution_device == "cuda" and os.path.exists("offload_gptq"):
-                logging.info("Cleaning up CPU offload directory: offload_gptq")
-                shutil.rmtree("offload_gptq")
 
     else:
         # This case should not be reachable due to the default logic
