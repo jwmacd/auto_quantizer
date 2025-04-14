@@ -8,7 +8,7 @@ import glob
 import psutil # Added for potential future RAM checks
 from accelerate import cpu_offload # Added for explicit CPU offload
 from awq import AutoAWQForCausalLM
-from transformers import AutoModelForCausalLM, GPTQConfig, AutoTokenizer
+from transformers import AutoModelForCausalLM, GPTQConfig, AutoTokenizer, AutoConfig
 from datasets import load_dataset
 import logging
 
@@ -66,8 +66,10 @@ def parse_arguments():
     # --- AWQ Specific Arguments (Calibration) --- 
     parser.add_argument('--batch_size', type=int, default=1,
                         help='Batch size for AWQ quantization calibration. Default: 1')
-    parser.add_argument('--seq_len', type=int, default=8192, # Default from AWQ, user can reduce
-                        help='Maximum sequence length for AWQ calibration data. Default: 8192')
+    parser.add_argument('--seq_len', type=int, default=2048, # Reduced default for safety
+                        help='Maximum sequence length to use for calibration data (AWQ & GPTQ). '
+                             'Reduces memory usage during quantization, especially for models with '
+                             'very long context windows. Default: 2048')
 
 
     # --- GPTQ Specific Arguments --- #
@@ -268,13 +270,61 @@ def main():
     elif quantization_method == 'gptq':
         # --- GPTQ Model Loading --- #
         logging.info("Preparing GPTQ configuration...")
+
+        # --- Config Modification for Sequence Length Control ---
+        logging.info(f"Loading original config from: {args.model_path} to control sequence length.")
+        original_config = None
+        original_seq_len_value = None
+        seq_len_attribute_name = None
+        modified_config = None
         try:
+            original_config = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
+            logging.info(f"Original config loaded. Relevant attributes: {original_config.to_dict()}") # Log original config
+
+            # Try common attribute names for max sequence length
+            possible_seq_len_attrs = ['max_position_embeddings', 'n_positions', 'seq_length']
+            for attr in possible_seq_len_attrs:
+                if hasattr(original_config, attr):
+                    seq_len_attribute_name = attr
+                    original_seq_len_value = getattr(original_config, seq_len_attribute_name)
+                    logging.info(f"Found sequence length attribute '{seq_len_attribute_name}' with original value: {original_seq_len_value}")
+                    break
+            
+            if not seq_len_attribute_name:
+                logging.warning(f"Could not automatically determine sequence length attribute in config. Attempting quantization without modification.")
+                modified_config = original_config # Proceed with original config
+            elif original_seq_len_value is None:
+                 logging.warning(f"Sequence length attribute '{seq_len_attribute_name}' found but has value None. Attempting quantization without modification.")
+                 modified_config = original_config # Proceed with original config
+            elif args.seq_len >= original_seq_len_value:
+                logging.info(f"Requested seq_len ({args.seq_len}) is >= original model max length ({original_seq_len_value}). No config modification needed.")
+                modified_config = original_config # Proceed with original config
+            else:
+                logging.info(f"Modifying '{seq_len_attribute_name}' from {original_seq_len_value} to {args.seq_len} for quantization.")
+                # Create a copy to modify, or modify in-place if AutoConfig allows/requires
+                # Assuming modification in-place is safe for from_pretrained
+                setattr(original_config, seq_len_attribute_name, args.seq_len)
+                modified_config = original_config
+                logging.info(f"Config modified. New '{seq_len_attribute_name}': {getattr(modified_config, seq_len_attribute_name)}")
+                logging.info(f"Modified config object attributes: {modified_config.to_dict()}") # Log modified config
+
+        except Exception as e:
+            logging.error(f"Error loading or modifying config: {e}. Will attempt to proceed without config modification.", exc_info=True)
+            # Fallback: try loading model without explicit config if modification failed
+            modified_config = None # Signal to use default loading path
+
+        # --- Prepare GPTQConfig ---
+        try:
+            # Note: We pass the tokenizer here, but the dataset loading/processing happens
+            # internally in transformers/optimum based on the dataset string name.
+            # The modified config (with shorter seq_len) should influence this internal processing.
             gptq_config = GPTQConfig(
-                bits=args.bits, 
-                dataset=args.gptq_dataset, # Still uses string name - need manual load for seq_len
+                bits=args.bits,
+                dataset=args.gptq_dataset, # Dataset name string
                 tokenizer=tokenizer,
                 group_size=args.gptq_group_size,
                 desc_act=args.gptq_desc_act,
+                # model_seqlen=args.seq_len # This might be an alternative, but less standard? Stick to config modification.
             )
             logging.info(f"Using GPTQ quantization config: {gptq_config}")
         except Exception as e:
@@ -283,15 +333,37 @@ def main():
 
         logging.info(f"Loading model for GPTQ from: {args.model_path} onto CPU initially")
         try:
-            # Load directly to CPU, passing quantization_config
-            # Quantization happens *during* this load when using quantization_config
+            # Load directly to CPU, passing potentially modified config and quantization_config
+            model_load_kwargs = {
+                "device_map": "cpu",
+                "trust_remote_code": True,
+                "quantization_config": gptq_config
+            }
+            # Only pass the config if we successfully loaded/modified it
+            if modified_config:
+                 model_load_kwargs["config"] = modified_config
+
             model = AutoModelForCausalLM.from_pretrained(
                 args.model_path,
-                device_map="cpu", # Load weights to CPU
-                trust_remote_code=True,
-                quantization_config=gptq_config 
+                **model_load_kwargs
             )
             logging.info(f"Model loaded onto CPU. Quantization implicitly handled via GPTQConfig during load.")
+
+            # --- Restore Original Sequence Length in Model's Config Object (In-Memory) ---
+            # Important: Restore it *after* quantization but *before* saving,
+            # so the saved config reflects the original model capability.
+            if seq_len_attribute_name and original_seq_len_value is not None and args.seq_len < original_seq_len_value:
+                try:
+                    logging.info(f"Restoring original sequence length '{seq_len_attribute_name}' ({original_seq_len_value}) in model's in-memory config.")
+                    setattr(model.config, seq_len_attribute_name, original_seq_len_value)
+                    logging.info(f"In-memory model config restored. Verified '{seq_len_attribute_name}': {getattr(model.config, seq_len_attribute_name)}")
+                    logging.info(f"Model's final in-memory config attributes: {model.config.to_dict()}") # Log restored in-memory config
+                except Exception as e:
+                    logging.error(f"Error restoring original sequence length in model's in-memory config: {e}", exc_info=True)
+            elif modified_config and not seq_len_attribute_name:
+                 logging.warning("Could not restore original sequence length in model config as attribute name was not identified.")
+            # If no modification happened, no restoration is needed.
+
 
             # Apply explicit CPU offload if using GPU *after* initial load/quantization
             if use_gpu_offload:
@@ -316,15 +388,54 @@ def main():
 
             # Identify the model weight files (.safetensors, .bin) and config files
             model_files = glob.glob(os.path.join(temp_dir, '*.safetensors')) + glob.glob(os.path.join(temp_dir, '*.bin'))
-            config_file = os.path.join(temp_dir, 'config.json') # Original config name in temp dir
+            config_file_temp = os.path.join(temp_dir, 'config.json') # Original config name in temp dir
             tokenizer_files = glob.glob(os.path.join(temp_dir, 'tokenizer*')) # tokenizer.json, tokenizer_config.json etc.
             special_tokens_map = os.path.join(temp_dir, 'special_tokens_map.json')
             if os.path.exists(special_tokens_map):
                 tokenizer_files.append(special_tokens_map)
 
             files_to_copy = model_files + tokenizer_files
-            if os.path.exists(config_file):
-                files_to_copy.append(config_file)
+            # Config handling is now different: we might need to restore original seq len
+            config_file_temp = os.path.join(temp_dir, 'config.json') # Original config name in temp dir
+
+            # --- Config Restoration Before Copying ---
+            # We already restored it in the model's in-memory config before model.save_pretrained
+            # So the config.json saved in temp_dir should *already* have the original length.
+            # Double-check just in case.
+            if os.path.exists(config_file_temp):
+                 files_to_copy.append(config_file_temp)
+                 try:
+                     with open(config_file_temp, 'r') as f:
+                         saved_config_data = json.load(f)
+                     logging.info(f"Read temporary config.json content before final check: {json.dumps(saved_config_data, indent=2)}") # Log loaded temp config
+
+                     # Verify if restoration is needed (e.g., if in-memory restoration failed or wasn't done)
+                     if seq_len_attribute_name and \
+                        seq_len_attribute_name in saved_config_data and \
+                        saved_config_data[seq_len_attribute_name] == args.seq_len and \
+                        original_seq_len_value is not None and \
+                        args.seq_len < original_seq_len_value:
+
+                         logging.warning(f"Saved config.json in temp dir still has the reduced sequence length ({args.seq_len}). "
+                                         f"Attempting to restore '{seq_len_attribute_name}' to {original_seq_len_value} before copying.")
+                         saved_config_data[seq_len_attribute_name] = original_seq_len_value
+                         
+                         # Rewrite the config file in the temp directory
+                         with open(config_file_temp, 'w') as f:
+                             json.dump(saved_config_data, f, indent=2)
+                         logging.info(f"Restored original sequence length in {config_file_temp}")
+                         logging.info(f"Rewritten temporary config.json content: {json.dumps(saved_config_data, indent=2)}") # Log rewritten temp config
+                     elif seq_len_attribute_name and seq_len_attribute_name in saved_config_data and saved_config_data[seq_len_attribute_name] == original_seq_len_value:
+                         logging.info(f"Verified config.json in temp dir already contains the original sequence length ({original_seq_len_value}). No rewrite needed.")
+                     elif seq_len_attribute_name and seq_len_attribute_name not in saved_config_data:
+                          logging.warning(f"Sequence length attribute '{seq_len_attribute_name}' not found in saved config.json. Cannot verify/restore.")
+                     # else: No modification was needed or attribute wasn't found - do nothing extra
+
+                 except Exception as e:
+                     logging.error(f"Error reading or modifying saved config.json in temp dir: {e}. Proceeding with copy.", exc_info=True)
+            else:
+                logging.warning(f"Config file 'config.json' not found in temp directory {temp_dir}. Cannot restore sequence length.")
+            # --- End Config Restoration ---
 
             logging.info(f"Copying {len(files_to_copy)} GPTQ-related files from temp dir to {args.model_path}")
             
