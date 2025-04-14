@@ -1,11 +1,12 @@
 # Use a base image with Python and CUDA support (PyTorch 2.3.0 / CUDA 12.1)
-FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+# Switch to the -devel image to include CUDA toolkit (nvcc, headers, etc.)
+FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-devel
 
 # Set the working directory in the container
 WORKDIR /app
 
-# Install git (needed for installing autoawq from GitHub)
-RUN apt-get update && apt-get install -y --no-install-recommends git && \
+# Install git (needed for AutoAWQ), build tools, and g++ explicitly
+RUN apt-get update && apt-get install -y --no-install-recommends git build-essential g++ && \
     rm -rf /var/lib/apt/lists/*
 
 # Copy requirements file first to leverage Docker cache
@@ -13,6 +14,9 @@ COPY requirements.txt /app/
 
 # Set CUDA architectures for auto-gptq build (RTX 3090 is 8.6, RTX 4090 is 8.9)
 ENV TORCH_CUDA_ARCH_LIST="8.6;8.9"
+
+# Set CUDA Home for builds that need it explicitly
+ENV CUDA_HOME=/usr/local/cuda
 
 # Install Python dependencies from requirements.txt and AutoAWQ from GitHub
 # Use --no-cache-dir to reduce image size
