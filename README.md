@@ -69,6 +69,9 @@ This project provides a Dockerized environment for **performing quantization of 
 | `--cpu_offload` | Enable CPU offloading for memory efficiency | `true` on GPU, `false` on CPU |
 | `--no_cpu_offload` | Disable CPU offloading (overrides --cpu_offload) | `false` |
 | `--load_in_8bit` | Load model in 8-bit mode first (uses less memory but may affect quality) | `false` |
+| `--batch_size` | Batch size for quantization calibration (smaller values use less memory) | `1` |
+| `--seq_length` | Maximum sequence length for calibration (shorter values use less memory) | `8192` |
+| `--gpu_memory` | Maximum GPU memory to use, e.g. "20GiB" (lower prevents OOM errors) | `20GiB` |
 | `--gptq_dataset` | Dataset for GPTQ calibration | `wikitext2` |
 | `--gptq_group_size` | Group size for GPTQ quantization | 128 |
 | `--gptq_desc_act` | Use descending activation order for GPTQ | `false` |
@@ -94,6 +97,14 @@ docker run --rm -it --gpus all \
   -v /path/to/your/host/models/YourModelName:/models:rw \
   auto_quantizer \
   --awq --quant_config '{"q_group_size": 64, "zero_point": true}'
+```
+
+**Memory-efficient configuration for large models:**
+```bash
+docker run --rm -it --gpus all \
+  -v /path/to/your/host/models/YourModelName:/models:rw \
+  auto_quantizer \
+  --batch_size 1 --seq_length 1024 --gpu_memory "18GiB"
 ```
 
 **Override automatic memory management:**
@@ -160,11 +171,18 @@ When configuring this container via the Unraid GUI:
 * **Memory Issues:** 
   * **Default behavior:** The script automatically configures optimal memory settings
   * **When quantization fails with OOM errors:**
-    * The script will automatically retry with more aggressive memory settings
-    * As a last resort, it will fall back to CPU-only quantization (much slower but reliable)
-  * **For extremely large models:**
+    * Reduce `--batch_size` to 1 (smallest possible value)
+    * Reduce `--seq_length` to 1024 or 512 (reduces quality slightly)
+    * Lower `--gpu_memory` to a smaller value like "18GiB" or "16GiB" 
     * Use `--load_in_8bit` for initial 8-bit loading (may slightly impact quality)
-    * For Qwen, LLaMA, Mistral, or Mixtral models, the script applies optimized settings automatically
+  * **For large models (Qwen, LLaMA, Mistral, Mixtral):**
+    * Example command for memory-intensive models:
+      ```
+      docker run --rm -it --gpus all \
+        -v /path/to/model:/models:rw \
+        auto_quantizer \
+        --batch_size 1 --seq_length 1024 --gpu_memory "18GiB"
+      ```
   * **To override automatic memory management:**
     * Use `--max_memory "20GiB"` to explicitly limit GPU memory usage
     * Use `--no_cpu_offload` to disable CPU offloading (faster but uses more GPU memory)

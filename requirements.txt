@@ -1,9 +1,10 @@
 torch>=2.1.0 --index-url https://download.pytorch.org/whl/cu121
 transformers>=4.36.0
-autoawq>=0.2.0
+# autoawq>=0.2.0 # Installed directly from git in Dockerfile
 accelerate>=0.25.0
 safetensors>=0.4.0
 optimum[gptq]>=1.16.0
+auto-gptq>=0.7.0 # Explicitly add auto-gptq
 datasets>=2.14.0
 psutil>=5.9.0
 huggingface_hub[hf_xet]
