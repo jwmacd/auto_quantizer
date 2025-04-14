@@ -6,6 +6,7 @@ import tempfile
 import shutil
 import glob
 import psutil # Added for potential future RAM checks
+from accelerate import cpu_offload # Added for explicit CPU offload
 from awq import AutoAWQForCausalLM
 from transformers import AutoModelForCausalLM, GPTQConfig, AutoTokenizer
 from datasets import load_dataset
@@ -37,7 +38,7 @@ DEFAULT_GPTQ_CONFIG = {
 
 # --- Argument Parsing --- #
 def parse_arguments():
-    parser = argparse.ArgumentParser(description="Quantize a model using AWQ or GPTQ, automatically using GPU if available, or CPU.")
+    parser = argparse.ArgumentParser(description="Quantize a model using AWQ or GPTQ, using explicit CPU offload if GPU is available.")
     parser.add_argument('--model_path', type=str, required=False,
                         default='/models',
                         help='Path to the directory containing the pre-trained model. Default: /models')
@@ -57,15 +58,12 @@ def parse_arguments():
     parser.add_argument('--quant_config', type=str, default='{}',
                         help='JSON string for custom quantization config, merging with method defaults.')
 
-    # --- Device and Memory Management ---
+    # --- Device Control --- 
     parser.add_argument('--force_cpu', action='store_true',
                         help='Force CPU execution even if GPU is available.')
-    parser.add_argument('--max_memory', type=str, default="1GiB",
-                        help='Maximum memory per GPU (e.g., "20GiB"). Used for device_map="auto". Default: 1GiB')
-    parser.add_argument('--cpu_offload', action='store_true', default=None, # Default is determined later
-                        help='Enable CPU offloading for GPU runs. Default: true if GPU, false if CPU.')
-    parser.add_argument('--no_cpu_offload', action='store_true', default=False,
-                        help='Disable CPU offloading (overrides --cpu_offload).')
+    # --max_memory, --cpu_offload, --no_cpu_offload are removed as we use explicit full CPU offload
+
+    # --- AWQ Specific Arguments (Calibration) --- 
     parser.add_argument('--batch_size', type=int, default=1,
                         help='Batch size for AWQ quantization calibration. Default: 1')
     parser.add_argument('--seq_len', type=int, default=8192, # Default from AWQ, user can reduce
@@ -92,7 +90,8 @@ def parse_arguments():
 def main():
     """
     Main function: Parses arguments, validates, selects method (AWQ/GPTQ),
-    detects hardware (CPU/GPU), performs quantization, and saves results.
+    loads model to CPU, applies explicit CPU offload if GPU available,
+    performs quantization, and saves results.
     """
     args = parse_arguments()
 
@@ -109,78 +108,23 @@ def main():
     
     logging.info(f"Selected method: {quantization_method.upper()}, Bits: {args.bits}")
 
-    # --- Determine Device and Configure Memory --- #
+    # --- Determine Execution Device --- #
     if args.force_cpu:
-        device = "cpu"
-        device_map = "cpu"
-        max_memory = None
+        execution_device = "cpu"
+        use_gpu_offload = False
         logging.info("Forcing CPU execution.")
     elif torch.cuda.is_available():
-        device = "cuda"
-        device_map = "auto" # Let accelerate handle distribution
-        # Configure max_memory for device_map="auto"
-        max_memory_dict = None
-        gpu_limit_gb = None # Track the per-GPU limit
-
-        if args.max_memory:
-            try:
-                # Simple parsing for now, assumes format like "20GiB"
-                max_memory_dict = {i: args.max_memory for i in range(torch.cuda.device_count())}
-                logging.info(f"Setting max_memory per GPU based on argument: {args.max_memory}")
-                # Attempt to parse the numeric part for potential CPU limit calculation (optional)
-                try: gpu_limit_gb = int(args.max_memory.lower().replace('gib', ''))
-                except: pass # Ignore if parsing fails
-            except Exception as e:
-                logging.warning(f"Could not parse --max_memory '{args.max_memory}'. Using accelerate's default. Error: {e}")
-                max_memory_dict = {}
-        else:
-            # Auto-detect GPU memory and set a limit
-            try:
-                total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-                buffer_gb = 1 
-                auto_max_memory_gb = int(total_mem_gb - buffer_gb)
-                if auto_max_memory_gb > 0:
-                    max_memory_dict = {i: f"{auto_max_memory_gb}GiB" for i in range(torch.cuda.device_count())}
-                    logging.info(f"Auto-detected GPU memory. Setting max_memory per GPU: {auto_max_memory_gb}GiB")
-                    gpu_limit_gb = auto_max_memory_gb
-                else:
-                    logging.warning("Could not auto-determine sufficient GPU memory. Using accelerate's default.")
-                    max_memory_dict = {}
-            except Exception as e:
-                 logging.warning(f"Failed to auto-determine GPU memory: {e}. Using accelerate's default.")
-                 max_memory_dict = {}
-
-        # *** Add explicit CPU memory limit ***
-        # Use a large fixed value since user has ample RAM and plans for larger models
-        cpu_limit = "350GiB"
-        max_memory_dict["cpu"] = cpu_limit
-        logging.info(f"Setting explicit CPU memory limit for offloading: {cpu_limit}")
-
-        max_memory = max_memory_dict # This dict now includes per-GPU and CPU limits
-
+        execution_device = "cuda:0" # Target the first GPU for computation
+        use_gpu_offload = True
         gpu_name = torch.cuda.get_device_name(0)
-        logging.info(f"GPU detected: {gpu_name}")
-        logging.info(f"Using device_map='{device_map}' with max_memory configuration: {max_memory}")
-        if quantization_method == 'gptq':
-            logging.warning("GPTQ is generally slower than AWQ, even on GPU.")
+        logging.info(f"GPU detected: {gpu_name}. Will use GPU {execution_device} for computation with full CPU offload.")
     else:
-        device = "cpu"
-        device_map = "cpu"
-        max_memory = None # No max_memory dict needed for CPU-only
-        logging.info("No GPU detected or --force_cpu used. Running on CPU.")
-        if quantization_method == 'gptq':
-            logging.warning("GPTQ on CPU is EXTREMELY slow.")
+        execution_device = "cpu"
+        use_gpu_offload = False
+        logging.info("No GPU detected. Running on CPU.")
 
-    # Configure CPU offloading (primarily for GPU runs)
-    if args.no_cpu_offload:
-        cpu_offload = False
-        logging.info("CPU offload explicitly disabled by --no_cpu_offload.")
-    elif args.cpu_offload is not None:
-        cpu_offload = args.cpu_offload
-        logging.info(f"CPU offload set to {cpu_offload} by argument.")
-    else: # Default behavior
-        cpu_offload = (device == "cuda") # Enable by default only if using GPU
-        logging.info(f"CPU offload automatically set to {cpu_offload} (enabled for GPU, disabled for CPU).")
+    if quantization_method == 'gptq' and execution_device == 'cpu':
+        logging.warning("GPTQ on CPU is EXTREMELY slow.")
 
     # Validate bits per method
     if quantization_method == 'awq' and args.bits != 4:
@@ -206,54 +150,49 @@ def main():
         logging.error(f"Error loading tokenizer from '{args.model_path}': {e}", exc_info=True)
         return
 
-    # --- Method Specific Logic --- #
-    # `device_map` and `max_memory` are now defined based on detection/args
-    # `cpu_offload` is determined above
-
+    # --- Model Loading and Offload Setup --- #
+    model = None # Initialize model variable
     if quantization_method == 'awq':
-        # --- AWQ Quantization --- # 
-        
-        # Merge default AWQ config with custom config
+        # --- AWQ Model Loading --- # 
         quant_config = {**DEFAULT_AWQ_CONFIG, **custom_config}
-        quant_config['w_bit'] = args.bits # Ensure bits argument overrides config
-        # Remove batch_size and seq_len from quant_config, they are passed directly to quantize
-        # quant_config['calib_batch_size'] = args.batch_size
-        # quant_config['calib_max_seq_len'] = args.seq_len
+        quant_config['w_bit'] = args.bits 
         logging.info(f"Using AWQ quantization config: {quant_config}")
 
-        logging.info(f"Loading model for AWQ from: {args.model_path} using device_map='{device_map}'")
-        load_kwargs = {
-            "trust_remote_code": True,
-            "safetensors": True,
-            "device_map": device_map, 
-        }
-        # Pass the max_memory dict (which now includes "cpu") if using GPU
-        if max_memory and device == "cuda":
-            load_kwargs["max_memory"] = max_memory
-        # Note: CPU offload is implicitly handled by device_map="auto" and max_memory settings
-        # No explicit cpu_offload boolean needed for AutoAWQ load?
-        # if cpu_offload and device == "cuda":
-        #      pass # AutoAWQ handles offloading internally
-        
+        logging.info(f"Loading model for AWQ from: {args.model_path} onto CPU initially")
         try:
+            # Load directly to CPU first
             model = AutoAWQForCausalLM.from_pretrained(
                 args.model_path,
-                **load_kwargs
+                trust_remote_code=True,
+                safetensors=True,
+                device_map="cpu" # Load all weights to CPU
             )
-            logging.info(f"Pre-trained model loaded successfully for AWQ using device_map='{device_map}'.")
+            logging.info(f"Pre-trained model loaded successfully for AWQ onto CPU.")
+
+            # Apply explicit CPU offload if using GPU
+            if use_gpu_offload:
+                logging.info(f"Applying accelerate explicit CPU offload to target device {execution_device}")
+                # Note: AWQ might have its own internal handling - monitor performance/errors
+                # Offload buffers might be needed depending on model structure?
+                cpu_offload(model, execution_device=execution_device, offload_buffers=False)
+                logging.info("Explicit CPU offload applied for AWQ.")
+            elif execution_device == "cpu":
+                 logging.info("Running AWQ on CPU without offload.")
+
         except Exception as e:
-            logging.error(f"Error loading model for AWQ from '{args.model_path}': {e}", exc_info=True)
+            logging.error(f"Error loading model or applying offload for AWQ from '{args.model_path}': {e}", exc_info=True)
             return
 
+        # --- AWQ Quantization --- #
         logging.info("Starting AWQ quantization...")
         try:
             # Pass tokenizer and merged quant_config
-            # Remove batch_size and max_seq_len, rely on autoawq defaults for now
+            # Relies on offload hook to move layers to execution_device
             model.quantize(
                 tokenizer,
                 quant_config=quant_config
-                # batch_size=args.batch_size, # Removed
-                # max_seq_len=args.seq_len  # Removed
+                # batch_size=args.batch_size, # Still relying on defaults / need research
+                # max_seq_len=args.seq_len  # Still relying on defaults / need research
             )
             logging.info("AWQ Quantization completed successfully.")
         except Exception as e:
@@ -327,55 +266,45 @@ def main():
             shutil.rmtree(temp_dir)
 
     elif quantization_method == 'gptq':
-        # --- GPTQ Quantization --- #
-        
-        # Merge default GPTQ config with custom config
-        gptq_base_config = {**DEFAULT_GPTQ_CONFIG, **custom_config} 
-        # Note: gptq args like dataset, group_size, desc_act are separate command line args now
-
+        # --- GPTQ Model Loading --- #
         logging.info("Preparing GPTQ configuration...")
         try:
-            # Use args directly for GPTQConfig
             gptq_config = GPTQConfig(
-                bits=args.bits, # Should be 8
-                dataset=args.gptq_dataset,
+                bits=args.bits, 
+                dataset=args.gptq_dataset, # Still uses string name - need manual load for seq_len
                 tokenizer=tokenizer,
                 group_size=args.gptq_group_size,
                 desc_act=args.gptq_desc_act,
-                # Potentially add batch_size/seq_len here if GPTQConfig supports them directly?
-                # Check Optimum documentation for GPTQConfig parameters if needed.
             )
             logging.info(f"Using GPTQ quantization config: {gptq_config}")
         except Exception as e:
             logging.error(f"Error creating GPTQConfig: {e}", exc_info=True)
             return
 
-        logging.info(f"Loading model for GPTQ from: {args.model_path} using device_map='{device_map}'")
-        load_kwargs = {
-            "trust_remote_code": True,
-            "device_map": device_map,
-            "quantization_config": gptq_config 
-        }
-        # Pass the max_memory dict (which now includes "cpu") if using GPU
-        if max_memory and device == "cuda":
-            load_kwargs["max_memory"] = max_memory
-        # Accelerate uses offload_folder when CPU offload is intense / disk might be involved
-        # Setting the cpu limit in max_memory should prevent disk, but keep folder just in case
-        if cpu_offload and device == "cuda":
-             load_kwargs["offload_folder"] = "offload_gptq" 
-
+        logging.info(f"Loading model for GPTQ from: {args.model_path} onto CPU initially")
         try:
+            # Load directly to CPU, passing quantization_config
+            # Quantization happens *during* this load when using quantization_config
             model = AutoModelForCausalLM.from_pretrained(
                 args.model_path,
-                **load_kwargs
+                device_map="cpu", # Load weights to CPU
+                trust_remote_code=True,
+                quantization_config=gptq_config 
             )
-            logging.info(f"Model loaded and quantization implicitly handled via GPTQConfig using device_map='{device_map}'.")
-        except Exception as e:
-            logging.error(f"Error loading model or initiating GPTQ quantization: {e}", exc_info=True)
-            return
+            logging.info(f"Model loaded onto CPU. Quantization implicitly handled via GPTQConfig during load.")
 
-        # GPTQ quantization happens during load with quantization_config
-        logging.info("GPTQ Quantization completed implicitly during model loading.")
+            # Apply explicit CPU offload if using GPU *after* initial load/quantization
+            if use_gpu_offload:
+                logging.info(f"Applying accelerate explicit CPU offload to target device {execution_device}")
+                # Offload buffers might be needed depending on model structure?
+                cpu_offload(model, execution_device=execution_device, offload_buffers=False)
+                logging.info("Explicit CPU offload applied for GPTQ.")
+            elif execution_device == "cpu":
+                 logging.info("Running GPTQ on CPU without offload.")
+
+        except Exception as e:
+            logging.error(f"Error loading model, running GPTQ, or applying offload: {e}", exc_info=True)
+            return
 
         # --- GPTQ Saving --- #
         temp_dir = tempfile.mkdtemp()
@@ -470,7 +399,7 @@ def main():
         finally:
             logging.info(f"Cleaning up temporary directory: {temp_dir}")
             shutil.rmtree(temp_dir)
-            if cpu_offload and device == "cuda" and os.path.exists("offload_gptq"):
+            if use_gpu_offload and execution_device == "cuda" and os.path.exists("offload_gptq"):
                 logging.info("Cleaning up CPU offload directory: offload_gptq")
                 shutil.rmtree("offload_gptq")
 
