@@ -14,10 +14,11 @@ This tool is primarily intended for users who need to quantize custom models loc
 ## Architecture
 
 - **Docker Container:** Encapsulates Python, PyTorch, CUDA (if applicable), quantization libraries (`autoawq`, `optimum[auto-gptq]`), `transformers`, `accelerate`, and other dependencies.
-- **Quantization Script (`quantize.py`):** The main entry point. Parses arguments, determines the execution device (GPU preferred, CPU fallback), loads the model using `device_map="cpu"`, orchestrates the selected quantization process (AWQ or GPTQ) applying the `--seq_len` parameter, monitors peak VRAM, and saves the results.
+- **Quantization Script (`quantize.py`):** The main entry point. Parses arguments, determines the execution device (GPU preferred, CPU fallback), loads the model using `device_map="cpu"`, orchestrates the selected quantization process (AWQ for text, GPTQ via Optimum for text, or GPTQ via LLM Compressor for vision) applying the `--seq_len` parameter (for text models), monitors peak VRAM, and saves the results.
 - **VRAM Monitoring (`utils/vram_monitor.py`):** A utility class run in a background thread to track peak GPU memory usage during quantization.
 - **Execution:** Runs on an available NVIDIA GPU by default. Can be forced to run entirely on CPU using `--force_cpu`. The quantization libraries handle internal layer processing on the target device.
-- **Input/Output:** Expects a host directory containing the pre-trained model mounted into the container at `/models`. Creates a new subdirectory named `METHOD-BITRATE` (e.g., `AWQ-4bit`, `GPTQ-8bit`) within the input model directory and saves the quantized model, tokenizer files, configuration, and `quantization_report.log` there.
+- **Input/Output:** Expects a host directory containing the pre-trained model mounted into the container at `/models`. Creates a new subdirectory named `METHOD-BITRATE` (e.g., `AWQ-4bit`, `GPTQ-8bit`) within the input model directory and saves the quantized model, tokenizer/processor files, configuration, and `quantization_report.log` there.
+- **Status Note:** GPTQ quantization for vision models using `llmcompressor` is currently **blocked** by an internal library error (`AttributeError: module 'torch' has no attribute 'OutOfMemoryError'`).
 
 ## Key Components
 
@@ -28,6 +29,13 @@ This tool is primarily intended for users who need to quantize custom models loc
 - **`README.md`:** User-facing documentation covering setup, usage, examples, command-line arguments, memory considerations, and troubleshooting.
 - **`devlog.md`:** Internal development log tracking history, decisions, status, and next steps.
 - **`project_context.md`:** (This file) High-level static overview of the project architecture, components, and conventions.
+- **AutoAWQ (`autoawq`)**
+- **Transformers (`transformers`)**
+- **Optimum (`optimum[auto-gptq]`)**
+- **LLM Compressor (`llm-compressor[torch]`)**
+- **Accelerate (`accelerate`)**
+- **Datasets (`datasets`)**
+- **Safetensors (`safetensors`)**
 
 ## Conventions
 
@@ -48,7 +56,6 @@ This tool is primarily intended for users who need to quantize custom models loc
 - AutoAWQ (`autoawq`)
 - Transformers (`transformers`)
 - Optimum (`optimum[auto-gptq]`)
+- LLM Compressor (`llm-compressor[torch]`)
 - Accelerate (`accelerate`)
-- Datasets (`datasets`)
-- Safetensors (`safetensors`)
-- PSUtil (`psutil`)
+- Datasets (`

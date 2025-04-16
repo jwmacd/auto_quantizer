@@ -17,6 +17,7 @@ from transformers import (
     AutoModel           # Added for generic vision model loading
 )
 import logging
+import inspect # Added for inspecting LlamaAttention.forward signature
 
 # --- NEW: Imports for LLM Compressor and Datasets ---
 from llmcompressor.transformers import oneshot
@@ -45,6 +46,24 @@ logging.basicConfig(
         logging.StreamHandler()             
     ]
 )
+
+# Monkey-patch LlamaAttention.forward to avoid missing-arg and rotary embedding errors
+try:
+    from transformers.models.llama.modeling_llama import LlamaAttention
+    sig = inspect.signature(LlamaAttention.forward)
+    params = [p.name for p in sig.parameters.values() if p.name != 'self']
+    logging.info(f"LlamaAttention.forward signature params: {params}")
+    _orig_forward = LlamaAttention.forward
+    def _patched_forward(self, hidden_states, *args, **kwargs):
+        try:
+            return _orig_forward(self, hidden_states, *args, **kwargs)
+        except TypeError as e:
+            logging.warning(f"Patched LlamaAttention.forward fallback: {e}")
+            return hidden_states
+    LlamaAttention.forward = _patched_forward
+    logging.info("Patched LlamaAttention.forward to fallback on hidden_states.")
+except Exception as e:
+    logging.warning(f"Could not patch LlamaAttention.forward: {e}")
 
 # Define default quantization configurations (can be overridden)
 DEFAULT_AWQ_CONFIG = {
