@@ -26,7 +26,7 @@ This tool is primarily intended for users who need to quantize custom models loc
 - **`quantize.py`:** The core quantization script handling argument parsing, model loading (`device_map="cpu"`), AWQ/GPTQ execution logic (using `--seq_len`), VRAM monitoring invocation, and saving results to the `METHOD-BITRATE` directory.
 - **`utils/vram_monitor.py`:** Contains the `VRAMMonitor` class for peak memory tracking.
 - **`README.md`:** User-facing documentation covering setup, usage, examples, command-line arguments, memory considerations, and troubleshooting.
-- **`historyandstatus.md`:** Internal development log tracking history, decisions, status, and next steps.
+- **`devlog.md`:** Internal development log tracking history, decisions, status, and next steps.
 - **`project_context.md`:** (This file) High-level static overview of the project architecture, components, and conventions.
 
 ## Conventions

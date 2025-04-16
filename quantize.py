@@ -9,7 +9,6 @@ import psutil # Added for potential future RAM checks
 from accelerate import cpu_offload # Added for explicit CPU offload
 from awq import AutoAWQForCausalLM
 from transformers import AutoModelForCausalLM, GPTQConfig, AutoTokenizer, AutoConfig
-from datasets import load_dataset
 import logging
 
 # --- Helper Function for Memory Logging ---
@@ -213,11 +212,11 @@ def main():
 
             # Pass tokenizer and merged quant_config
             # AutoAWQ handles device placement internally
+            logging.info("Relying on AutoAWQ's default internal calibration dataset.")
             model.quantize(
                 tokenizer,
                 quant_config=quant_config,
-                max_seq_len=args.seq_len # Explicitly pass seq_len
-                # batch_size=args.batch_size, # Pass batch_size if needed
+                max_calib_seq_len=args.seq_len # Correct parameter per docs
             )
             logging.info("AWQ Quantization completed successfully.")
 
@@ -310,7 +309,7 @@ def main():
             for attr in possible_seq_len_attrs:
                 if hasattr(original_config, attr):
                     seq_len_attribute_name = attr
-                    original_seq_len_value = getattr(original_config, seq_len_attribute_name)
+                    original_seq_len_value = getattr(original_config, attr)
                     logging.info(f"Found sequence length attribute '{seq_len_attribute_name}' with original value: {original_seq_len_value}")
                     break
             
@@ -511,7 +510,7 @@ def main():
                 dest_path = os.path.join(output_dir, dest_filename)
                 if os.path.exists(dest_path):
                      # Avoid potential overwrite warnings if json/py globs overlap
-                     if file_path == dest_path: continue
+                     if file_path == dest_path: continue 
                      logging.warning(f"Destination file {dest_path} already exists. Overwriting.")
                 
                 logging.debug(f"Copying {file_path} to {dest_path}")
