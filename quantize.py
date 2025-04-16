@@ -277,33 +277,39 @@ def main():
         # --- AWQ Quantization --- #
         logging.info("Starting AWQ quantization...")
         try:
-            # --- Log memory before quantization and reset peak counter ---
-            log_gpu_memory_usage("Before AWQ Quantization", execution_device)
-            if use_gpu_offload:
-                torch.cuda.reset_peak_memory_stats(execution_device)
-                logging.info(f"Reset peak memory stats for {execution_device}.")
-            # -------------------------------------------------------------
-
-            # Pass tokenizer and merged quant_config
-            # AutoAWQ handles device placement internally
-            logging.info("Relying on AutoAWQ's default internal calibration dataset.")
-            model.quantize(
-                processor_or_tokenizer, # Pass tokenizer
-                quant_config=quant_config,
-                max_calib_seq_len=args.seq_len # Correct parameter per docs
-            )
-            logging.info("AWQ Quantization completed successfully.")
-
-            # --- Log memory after quantization, including peak ---
-            if use_gpu_offload:
-                 peak_reserved = torch.cuda.max_memory_reserved(execution_device) / (1024**3)
-                 logging.info(f"Peak GPU Memory Reserved during AWQ Quantization on {execution_device}: {peak_reserved:.2f} GB")
-            log_gpu_memory_usage("After AWQ Quantization", execution_device)
-            # --------------------------------------------------------
-
+            # AWQ quantization with auto-retry on OOM by halving seq_len
+            calib_seq = args.seq_len
+            while True:
+                try:
+                    log_gpu_memory_usage("Before AWQ Quantization", execution_device)
+                    if use_gpu_offload:
+                        torch.cuda.reset_peak_memory_stats(execution_device)
+                        logging.info(f"Reset peak memory stats for {execution_device}.")
+                    logging.info(f"Relying on AutoAWQ's default internal calibration dataset with seq_len={calib_seq}.")
+                    model.quantize(
+                        processor_or_tokenizer,
+                        quant_config=quant_config,
+                        max_calib_seq_len=calib_seq
+                    )
+                    logging.info(f"AWQ Quantization completed successfully with seq_len={calib_seq}.")
+                    break
+                except torch.cuda.OutOfMemoryError as oom:
+                    logging.warning(f"AWQ OOM at seq_len={calib_seq}, retrying with seq_len={calib_seq//2}.")
+                    torch.cuda.empty_cache()
+                    calib_seq //= 2
+                    if calib_seq < 64:
+                        logging.error("AWQ OOM persists even at minimal seq_len. Aborting.")
+                        raise
         except Exception as e:
             logging.error(f"Error during AWQ quantization: {e}", exc_info=True)
             return
+
+        # --- Log memory after quantization, including peak ---
+        if use_gpu_offload:
+             peak_reserved = torch.cuda.max_memory_reserved(execution_device) / (1024**3)
+             logging.info(f"Peak GPU Memory Reserved during AWQ Quantization on {execution_device}: {peak_reserved:.2f} GB")
+        log_gpu_memory_usage("After AWQ Quantization", execution_device)
+        # --------------------------------------------------------
 
         # --- AWQ Saving --- #
         # NOTE: AutoAWQ's save_quantized saves with standard names already in the temp dir.
@@ -540,7 +546,7 @@ def main():
                     # Assume dataset has columns that the processor can handle implicitly.
                     # Limit samples *after* loading for simplicity here.
                     # --- ADDING HARDCODED TOKEN --- #
-                    hf_token = "REMOVED"
+                    #hf_token = "To be added"
                     logging.info("Using hardcoded HF token for gated dataset access.")
                     logging.info(f"Attempting to load dataset '{args.vision_calibration_dataset}'...") # Log before
                     calibration_dataset_raw = load_dataset(
