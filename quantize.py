@@ -122,6 +122,12 @@ def parse_arguments():
         args.awq = True
         logging.info("Neither --awq nor --gptq specified, defaulting to AWQ.")
 
+    # --- NEW: Set default vision calibration dataset for GPTQ --- 
+    if args.model_type == 'vision' and args.gptq and args.vision_calibration_dataset is None:
+        args.vision_calibration_dataset = 'imagenet-1k' 
+        logging.info(f"--vision_calibration_dataset not specified for vision GPTQ, defaulting to '{args.vision_calibration_dataset}'")
+    # ------------------------------------------------------------
+
     return args
 
 def main():
@@ -399,45 +405,46 @@ def main():
                  modified_config = None
                  original_config = None
 
-        # --- Prepare GPTQConfig ---
-        try:
-            gptq_config_args = {
-                "bits": args.bits,
-                "group_size": args.gptq_group_size,
-                "desc_act": args.gptq_desc_act,
-                # "model_seqlen": args.seq_len # Stick to config modification for text
-            }
+        # --- Prepare GPTQConfig --- 
+        # MOVED INSIDE TEXT MODEL PATH BELOW
+        # try:
+        #     gptq_config_args = {
+        #         "bits": args.bits,
+        #         "group_size": args.gptq_group_size,
+        #         "desc_act": args.gptq_desc_act,
+        #         # "model_seqlen": args.seq_len # Stick to config modification for text
+        #     }
             
-            if args.model_type == 'text':
-                # For text models, provide dataset name and tokenizer
-                gptq_config_args["dataset"] = args.gptq_dataset
-                gptq_config_args["tokenizer"] = processor_or_tokenizer
-                logging.info(f"Using GPTQ dataset: {args.gptq_dataset}")
-            elif args.model_type == 'vision':
-                # For vision models, provide vision dataset name if specified
-                # Note: The actual handling of image datasets is complex and depends
-                # on the `optimum` / `auto-gptq` implementation details.
-                # This assumes a compatible dataset name is provided via argument.
-                if args.vision_calibration_dataset:
-                     gptq_config_args["dataset"] = args.vision_calibration_dataset
-                     # Optimum might need other args like 'num_samples', 'feature_extractor' (passed via processor)
-                     # The processor is not directly passed here, but from_pretrained should use it implicitly if needed.
-                     # Check optimum/auto-gptq docs for exact requirements for image calibration.
-                     logging.info(f"Using GPTQ vision dataset: {args.vision_calibration_dataset}")
-                     # Add nsamples - assuming optimum uses this parameter name
-                     gptq_config_args["nsamples"] = args.vision_calibration_nsamples 
-                else:
-                    # This path should ideally not be hit if we require the dataset for vision
-                    logging.warning("No --vision_calibration_dataset specified for vision model GPTQ. "
-                                    "Calibration might fail or use a potentially unsuitable default.")
-                # DO NOT pass tokenizer for vision models
-                # The image processor loaded earlier should be implicitly used by the loader if needed.
+        #     if args.model_type == 'text':
+        #         # For text models, provide dataset name and tokenizer
+        #         gptq_config_args["dataset"] = args.gptq_dataset
+        #         gptq_config_args["tokenizer"] = processor_or_tokenizer
+        #         logging.info(f"Using GPTQ dataset: {args.gptq_dataset}")
+        #     elif args.model_type == 'vision':
+        #         # For vision models, provide vision dataset name if specified
+        #         # Note: The actual handling of image datasets is complex and depends
+        #         # on the `optimum` / `auto-gptq` implementation details.
+        #         # This assumes a compatible dataset name is provided via argument.
+        #         if args.vision_calibration_dataset:
+        #              gptq_config_args["dataset"] = args.vision_calibration_dataset
+        #              # Optimum might need other args like 'num_samples', 'feature_extractor' (passed via processor)
+        #              # The processor is not directly passed here, but from_pretrained should use it implicitly if needed.
+        #              # Check optimum/auto-gptq docs for exact requirements for image calibration.
+        #              logging.info(f"Using GPTQ vision dataset: {args.vision_calibration_dataset}")
+        #              # Add nsamples - assuming optimum uses this parameter name
+        #              gptq_config_args["nsamples"] = args.vision_calibration_nsamples 
+        #         else:
+        #             # This path should ideally not be hit if we require the dataset for vision
+        #             logging.warning("No --vision_calibration_dataset specified for vision model GPTQ. "
+        #                             "Calibration might fail or use a potentially unsuitable default.")
+        #         # DO NOT pass tokenizer for vision models
+        #         # The image processor loaded earlier should be implicitly used by the loader if needed.
 
-            gptq_config = GPTQConfig(**gptq_config_args)
-            logging.info(f"Using GPTQ quantization config: {gptq_config}")
-        except Exception as e:
-            logging.error(f"Error creating GPTQConfig: {e}", exc_info=True)
-            return
+        #     gptq_config = GPTQConfig(**gptq_config_args)
+        #     logging.info(f"Using GPTQ quantization config: {gptq_config}")
+        # except Exception as e:
+        #     logging.error(f"Error creating GPTQConfig: {e}", exc_info=True)
+        #     return
 
         logging.info(f"Loading model for GPTQ from: {args.model_path} onto CPU initially")
         try:
@@ -460,8 +467,26 @@ def main():
 
             # Choose the right AutoModel class based on model type
             if args.model_type == 'text':
-                ModelClass = AutoModelForCausalLM
                 # --- TEXT MODEL GPTQ PATH (using Transformers/Optimum) ---
+                
+                # --- Prepare GPTQConfig (NOW INSIDE text path) ---
+                try:
+                    gptq_config_args = {
+                        "bits": args.bits,
+                        "group_size": args.gptq_group_size,
+                        "desc_act": args.gptq_desc_act,
+                        "dataset": args.gptq_dataset,
+                        "tokenizer": processor_or_tokenizer,
+                         # "model_seqlen": args.seq_len # Stick to config modification
+                    }
+                    gptq_config = GPTQConfig(**gptq_config_args)
+                    logging.info(f"Using GPTQ quantization config: {gptq_config}")
+                except Exception as e:
+                    logging.error(f"Error creating GPTQConfig for TEXT model: {e}", exc_info=True)
+                    return
+                # --- End GPTQConfig Preparation ---
+
+                ModelClass = AutoModelForCausalLM
                 logging.info(f"Using Model Class: {ModelClass.__name__}")
                 model_load_kwargs["quantization_config"] = gptq_config # Pass GPTQConfig for text models
 
@@ -495,10 +520,24 @@ def main():
                     # TODO: Make split configurable? Handle different dataset structures?
                     # Assume dataset has columns that the processor can handle implicitly.
                     # Limit samples *after* loading for simplicity here.
-                    calibration_dataset_raw = load_dataset(args.vision_calibration_dataset, split='train')
+                    # --- ADDING HARDCODED TOKEN --- #
+                    hf_token = "REMOVED"
+                    logging.info("Using hardcoded HF token for gated dataset access.")
+                    logging.info(f"Attempting to load dataset '{args.vision_calibration_dataset}'...") # Log before
+                    calibration_dataset_raw = load_dataset(
+                        args.vision_calibration_dataset, 
+                        split='train',
+                        token=hf_token, # Pass token for authentication
+                        trust_remote_code=True # Allow dataset script execution
+                        )
+                    logging.info(f"Dataset '{args.vision_calibration_dataset}' loaded successfully.") # Log after
+                    # --- END TOKEN MODIFICATION --- #
+
                     # Select a subset of samples
                     num_samples = min(args.vision_calibration_nsamples, len(calibration_dataset_raw))
+                    logging.info(f"Selecting {num_samples} samples for calibration...") # Log before
                     calibration_dataset_subset = calibration_dataset_raw.select(range(num_samples))
+                    logging.info(f"Selected {num_samples} samples.") # Log after
                     logging.info(f"Using {num_samples} samples for calibration.")
                     
                     # IMPORTANT: LLMCompressor might need specific preprocessing or column names.
@@ -509,14 +548,14 @@ def main():
                     # We need to figure out how to convert the Hugging Face dataset object.
                     # For now, passing the Dataset object directly and hoping `oneshot` handles it.
                     # This is a likely point of failure or required adjustment.
-                    calibration_data_for_compressor = calibration_dataset_subset 
-                    logging.warning("Passing Hugging Face Dataset object directly to llmcompressor. This might require preprocessing depending on the model and dataset structure.")
+                    # calibration_data_for_compressor = calibration_dataset_subset 
+                    # logging.warning("Passing Hugging Face Dataset object directly to llmcompressor. This might require preprocessing depending on the model and dataset structure.")
 
                 except Exception as e:
                     logging.error(f"Failed to load or process calibration dataset '{args.vision_calibration_dataset}': {e}", exc_info=True)
                     return
 
-                # --- NEW: Preprocess the dataset for LLM Compressor ---
+                # --- NEW: Preprocess the dataset for LLM Compressor --- 
                 if processor_or_tokenizer is None:
                     logging.error("Image processor was not loaded successfully, cannot preprocess calibration data.")
                     return
@@ -542,18 +581,28 @@ def main():
                         # Apply the processor to the image column
                         # The processor should handle PIL images/arrays and return tensors
                         processed = processor_or_tokenizer(images=examples[image_column], return_tensors="pt")
-                        return processed # Should contain 'pixel_values'
+                        # Explicitly return only pixel_values, assuming that's all oneshot needs
+                        if "pixel_values" in processed:
+                           return {"pixel_values": processed["pixel_values"]}
+                        else:
+                            # Log an error if pixel_values are somehow missing
+                            logging.error(f"'pixel_values' not found in processor output. Keys: {processed.keys()}")
+                            # Return the original processed dict to potentially reveal the issue, 
+                            # although this will likely cause the same Arrow error or others.
+                            return processed 
 
                     # Apply preprocessing
                     # Set batched=True for efficiency
                     # Keep only the columns generated by the processor (typically 'pixel_values')
                     # Preserve original columns needed by the model *if any* (unlikely for pure vision calibration)
                     original_columns = calibration_dataset_subset.column_names
+                    logging.info(f"Starting dataset mapping (preprocessing {num_samples} samples)...") # Log before map
                     calibration_data_for_compressor = calibration_dataset_subset.map(
                         preprocess_vision, 
                         batched=True, 
                         remove_columns=original_columns # Remove original cols, keep only processor output
                     )
+                    logging.info(f"Dataset mapping complete.") # Log after map
                     logging.info(f"Preprocessing complete. Dataset columns for oneshot: {calibration_data_for_compressor.column_names}")
 
                 except Exception as e:
@@ -565,7 +614,9 @@ def main():
                 # Using args.bits (although we validated it's 8 for vision GPTQ earlier)
                 logging.info(f"Preparing LLM Compressor GPTQModifier with bits={args.bits}")
                 modifier = GPTQModifier(
-                    bits=args.bits, 
+                    # bits=args.bits, 
+                    scheme="W8A8",      # Explicitly set scheme
+                    targets="Linear",   # Explicitly set target layers
                     # Other GPTQ params like group_size, desc_act might be settable here if needed
                     # group_size=args.gptq_group_size, 
                     # desc_act=args.gptq_desc_act
@@ -579,6 +630,17 @@ def main():
                     torch.cuda.reset_peak_memory_stats(execution_device) # Reset peak counter again
                     logging.info(f"Reset peak memory stats before llmcompressor on {execution_device}.")
                 
+                # --- Define output_dir for oneshot --- #
+                output_suffix = "GPTQ"
+                output_subdir_name = f"{output_suffix}-{args.bits}bit"
+                # Note: We use the *final* output dir here. oneshot might just use it for logging
+                # or internal state, not necessarily immediate saving.
+                output_dir = os.path.join(args.model_path, output_subdir_name)
+                logging.info(f"Providing output directory to oneshot: {output_dir}")
+                # Ensure the base path exists for potential logging inside oneshot
+                os.makedirs(args.model_path, exist_ok=True) 
+                # --- End output_dir definition ---
+
                 try:
                     # Apply quantization
                     # Assuming oneshot modifies the model in-place or returns the modified model
@@ -588,7 +650,9 @@ def main():
                     oneshot(
                         model=model, 
                         dataset=calibration_data_for_compressor, 
-                        modifiers=[modifier],
+                        recipe=[modifier], # Use 'recipe' argument instead of 'modifiers'
+                        output_dir=output_dir, # Pass output directory
+                        tokenizer=args.model_path # Pass model path as tokenizer identifier
                         # Pass the processor if needed? Check oneshot arguments
                         # feature_extractor=processor_or_tokenizer 
                     )

@@ -18,7 +18,10 @@ ENV TORCH_CUDA_ARCH_LIST="8.6;8.9"
 # Use --no-cache-dir to reduce image size
 RUN pip install --no-cache-dir \
     git+https://github.com/casper-hansen/AutoAWQ.git && \
-    pip install --no-cache-dir -r /app/requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
+    pip install --no-cache-dir \
+        llmcompressor[transformers] \
+        -r /app/requirements.txt \
+        --extra-index-url https://download.pytorch.org/whl/cu121
 
 # Clean up git after installation (optional, reduces image size slightly)
 # RUN apt-get purge -y --auto-remove git && apt-get clean
