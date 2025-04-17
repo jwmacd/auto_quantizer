@@ -546,7 +546,6 @@ def main():
                     # Assume dataset has columns that the processor can handle implicitly.
                     # Limit samples *after* loading for simplicity here.
                     # --- ADDING HARDCODED TOKEN --- #
-                    #hf_token = "To be added"
                     logging.info("Using hardcoded HF token for gated dataset access.")
                     logging.info(f"Attempting to load dataset '{args.vision_calibration_dataset}'...") # Log before
                     calibration_dataset_raw = load_dataset(
