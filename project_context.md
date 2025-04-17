@@ -2,60 +2,52 @@
 
 ## Project Overview
 
-This project provides a Dockerized environment for quantizing large language models using AWQ (typically 4-bit) or GPTQ (typically 8-bit) methods. It aims to simplify the quantization workflow by providing a unified command-line interface and encapsulating dependencies.
+This project provides a **Dockerised**, memory‑efficient workflow for quantising Hugging Face text models to **4‑bit AWQ**. It intentionally drops all previous GPTQ and vision functionality to keep the stack lean and reliable.
 
-A core design principle is **memory efficiency** for single-GPU setups. This is achieved by:
-*   Loading the base model initially to CPU RAM (`device_map="cpu"`).
-*   Providing control over the calibration sequence length (`--seq_len`) to manage peak VRAM usage during quantization.
-*   Logging peak VRAM usage for monitoring and tuning.
-
-This tool is primarily intended for users who need to quantize custom models locally and possess hardware with sufficient CPU RAM and GPU VRAM for the chosen model and method.
+Key design goals:
+* **Single‑GPU friendly** – the base model is first loaded on **CPU** (`device_map="cpu"`) and layers are moved to GPU only when needed.
+* **Automatic OOM recovery** – if the chosen calibration sequence length causes an out‑of‑memory error, the script halves the length and retries until it succeeds (or reaches the hard minimum of 64 tokens).
+* **One‑command usage** – a single script, `awq_quantize.py`, handles the entire process.
 
 ## Architecture
 
-- **Docker Container:** Encapsulates Python, PyTorch, CUDA (if applicable), quantization libraries (`autoawq`, `optimum[auto-gptq]`), `transformers`, `accelerate`, and other dependencies.
-- **Quantization Script (`quantize.py`):** The main entry point. Parses arguments, determines the execution device (GPU preferred, CPU fallback), loads the model using `device_map="cpu"`, orchestrates the selected quantization process (AWQ for text, GPTQ via Optimum for text, or GPTQ via LLM Compressor for vision) applying the `--seq_len` parameter (for text models), monitors peak VRAM, and saves the results.
-- **VRAM Monitoring (`utils/vram_monitor.py`):** A utility class run in a background thread to track peak GPU memory usage during quantization.
-- **Execution:** Runs on an available NVIDIA GPU by default. Can be forced to run entirely on CPU using `--force_cpu`. The quantization libraries handle internal layer processing on the target device.
-- **Input/Output:** Expects a host directory containing the pre-trained model mounted into the container at `/models`. Creates a new subdirectory named `METHOD-BITRATE` (e.g., `AWQ-4bit`, `GPTQ-8bit`) within the input model directory and saves the quantized model, tokenizer/processor files, configuration, and `quantization_report.log` there.
-- **Status Note:** GPTQ quantization for vision models using `llmcompressor` is currently **blocked** by an internal library error (`AttributeError: module 'torch' has no attribute 'OutOfMemoryError'`).
+- **Docker container** – ships with Python 3, PyTorch + CUDA, AutoAWQ, Transformers, Accelerate and Safetensors. No GPTQ / vision dependencies are included.
+- **Quantisation script (`awq_quantize.py`)** – parses CLI arguments, selects the execution device (GPU preferred), loads the model on CPU, runs AWQ quantisation with automatic seq‑len back‑off, and saves the artefacts.
+- **Execution** – runs on the first available NVIDIA GPU by default; use `--force_cpu` to disable GPU usage.
+- **Input / Output** –
+  * **Input**: a directory containing the full‑precision model (e.g. a path mounted into the container).
+  * **Output**: a sub‑directory called `AWQ-4bit` (or a custom `--output_dir`) holding the quantised weights (`*.safetensors`), tokenizer files and `config.json`.
 
 ## Key Components
 
-- **`Dockerfile`:** Defines the Docker image, installing dependencies from `requirements.txt`.
-- **`requirements.txt`:** Lists Python package dependencies.
-- **`quantize.py`:** The core quantization script handling argument parsing, model loading (`device_map="cpu"`), AWQ/GPTQ execution logic (using `--seq_len`), VRAM monitoring invocation, and saving results to the `METHOD-BITRATE` directory.
-- **`utils/vram_monitor.py`:** Contains the `VRAMMonitor` class for peak memory tracking.
-- **`README.md`:** User-facing documentation covering setup, usage, examples, command-line arguments, memory considerations, and troubleshooting.
-- **`devlog.md`:** Internal development log tracking history, decisions, status, and next steps.
-- **`project_context.md`:** (This file) High-level static overview of the project architecture, components, and conventions.
-- **AutoAWQ (`autoawq`)**
-- **Transformers (`transformers`)**
-- **Optimum (`optimum[auto-gptq]`)**
-- **LLM Compressor (`llm-compressor[torch]`)**
-- **Accelerate (`accelerate`)**
-- **Datasets (`datasets`)**
-- **Safetensors (`safetensors`)**
+- `Dockerfile` – builds the lightweight image with the trimmed dependency set.
+- `requirements.txt` – lists only the packages needed for AWQ.
+- `awq_quantize.py` – the single entry point; implements automatic sequence‑length back‑off.
+- `README.md` – user‑facing documentation.
+- `devlog.md` – internal development log.
 
 ## Conventions
 
-- AWQ default: 4-bit.
-- GPTQ default: 8-bit.
-- Default calibration sequence length (`--seq_len`): 2048.
-- Method selection via mutually exclusive flags: `--awq` (default if neither specified) or `--gptq`.
-- Execution device determined automatically (GPU preferred), override with `--force_cpu`.
-- Base model loading uses `device_map="cpu"` strategy.
-- Output is saved in a subdirectory named `METHOD-BITRATE` (e.g., `AWQ-4bit`, `GPTQ-8bit`) inside the input model directory.
-- Peak VRAM usage is logged to `quantization_report.log` within the output subdirectory.
+- Quantisation method: **AWQ 4‑bit** only.
+- Default calibration sequence length: **2048** tokens.
+- Automatic back‑off halving rule: 2048 → 1024 → 512 … down to 64 tokens.
+- Execution device: GPU if available, otherwise CPU (or use `--force_cpu`).
+- Output directory: `AWQ-4bit` inside the input model folder unless overridden.
 
 ## Dependencies
 
-- Python 3.x
-- Docker
-- PyTorch (with CUDA support if GPU is used)
-- AutoAWQ (`autoawq`)
-- Transformers (`transformers`)
-- Optimum (`optimum[auto-gptq]`)
-- LLM Compressor (`llm-compressor[torch]`)
-- Accelerate (`accelerate`)
-- Datasets (`
+- Python 3.9+
+- PyTorch (compatible with your CUDA toolkit)
+- AutoAWQ (latest, installed from the official Git repo)
+- Transformers
+- Accelerate
+- Safetensors
+- Docker (optional, but recommended for consistent environments)
+
+## Tooling
+
+- `build_and_push.ps1` – Windows‑friendly helper to build the Docker image and push it to a registry (`docker login` required).
+
+---
+
+This condensed context reflects the refactored, AWQ‑only codebase and deployment environment.

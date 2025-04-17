@@ -1,48 +1,40 @@
 # Use a base image with Python and CUDA support (PyTorch 2.3.0 / CUDA 12.1)
 FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
 
-# Set the working directory in the container
-WORKDIR /app
-
-# Install git (needed for installing autoawq from GitHub)
-RUN apt-get update && apt-get install -y --no-install-recommends git && \
+# -----------------------------------------------------------------------------
+# Install build tools and git (needed for Triton JIT + AutoAWQ installation)
+# -----------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        git && \
     rm -rf /var/lib/apt/lists/*
 
-# Copy requirements file first to leverage Docker cache
+# -----------------------------------------------------------------------------
+# Workdir & requirements
+# -----------------------------------------------------------------------------
+WORKDIR /app
+
+# Copy requirements early to leverage Docker layer caching
 COPY requirements.txt /app/
 
-# Set CUDA architectures for auto-gptq build (RTX 3090 is 8.6, RTX 4090 is 8.9)
-ENV TORCH_CUDA_ARCH_LIST="8.6;8.9"
+# -----------------------------------------------------------------------------
+# Python packages – AWQ only
+# -----------------------------------------------------------------------------
+# 1) AutoAWQ from GitHub (provides latest triton kernels)
+# 2) Rest of deps from requirements.txt (torch already in base image)
+# -----------------------------------------------------------------------------
+RUN pip install --no-cache-dir git+https://github.com/casper-hansen/AutoAWQ.git && \
+    pip install --no-cache-dir -r /app/requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
 
-# Install Python dependencies from requirements.txt and AutoAWQ from GitHub
-# Use --no-cache-dir to reduce image size
-RUN pip install --no-cache-dir \
-    git+https://github.com/casper-hansen/AutoAWQ.git && \
-    pip install --no-cache-dir \
-        llmcompressor[transformers] \
-        -r /app/requirements.txt \
-        --extra-index-url https://download.pytorch.org/whl/cu121
+# -----------------------------------------------------------------------------
+# Copy application code
+# -----------------------------------------------------------------------------
+COPY awq_quantize.py /app/
 
-# Clean up git after installation (optional, reduces image size slightly)
-# RUN apt-get purge -y --auto-remove git && apt-get clean
-
-# Copy the quantization script into the container
-COPY quantize.py /app/
-
-# Set the default command to run the script with python
-# Expects model path and optionally quant config via command line args or Docker CMD override
-ENTRYPOINT ["python", "/app/quantize.py"]
-
-# Remove redundant lines from previous version if they exist
-# RUN apt-get update && apt-get install -y --no-install-recommends git && \
-#     pip install --no-cache-dir \
-#         git+https://github.com/casper-hansen/AutoAWQ.git \
-#         transformers~=4.45.0 \
-#         accelerate~=0.30.0 \
-#         safetensors \
-#         psutil \
-#         datasets \
-#         huggingface_hub[hf_xet] && \
-#     apt-get purge -y --auto-remove git && \
-#     rm -rf /var/lib/apt/lists/*
-# RUN pip install --no-cache-dir -r /app/requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
+# -----------------------------------------------------------------------------
+# Default command – run quantiser automatically
+# -----------------------------------------------------------------------------
+# Users only need to mount their model dir to /models (rw)
+# Optional extra args can be appended via Docker run command or Unraid template
+# -----------------------------------------------------------------------------
+ENTRYPOINT ["python", "/app/awq_quantize.py", "--model_path", "/models"]
