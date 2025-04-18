@@ -1,5 +1,6 @@
 torch>=2.3.0 --index-url https://download.pytorch.org/whl/cu121
-transformers>=4.37.0
+transformers>=4.40.1
+triton==2.1.0                # optional but locks kernels
 accelerate>=0.25.0
 safetensors>=0.4.0
 huggingface_hub

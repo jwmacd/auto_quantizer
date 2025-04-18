@@ -20,11 +20,13 @@ COPY requirements.txt /app/
 # -----------------------------------------------------------------------------
 # Python packages – AWQ only
 # -----------------------------------------------------------------------------
-# 1) AutoAWQ from GitHub (provides latest triton kernels)
-# 2) Rest of deps from requirements.txt (torch already in base image)
-# -----------------------------------------------------------------------------
-RUN pip install --no-cache-dir git+https://github.com/casper-hansen/AutoAWQ.git && \
+# 1) AutoAWQ from GitHub main branch (latest fixes)
+RUN pip install --no-cache-dir --upgrade \
+        git+https://github.com/casper-hansen/AutoAWQ.git@main && \
     pip install --no-cache-dir -r /app/requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
+
+# Ensure unbuffered output for logging
+ENV PYTHONUNBUFFERED=1
 
 # -----------------------------------------------------------------------------
 # Copy application code

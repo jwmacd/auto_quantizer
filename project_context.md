@@ -33,6 +33,7 @@ Key design goals:
 - Automatic back‑off halving rule: 2048 → 1024 → 512 … down to 64 tokens.
 - Execution device: GPU if available, otherwise CPU (or use `--force_cpu`).
 - Output directory: `AWQ-4bit` inside the input model folder unless overridden.
+- High-quality mode: use `--max_quality` to force CPU-only, apply advanced calibration settings (keep specific layers in FP16, descending activation order, zero-point, extended sequence length and dataset, double-scale search, outlier rescue), and save results in `AWQ-4bit-MAX` subdirectory.
 
 ## Dependencies
 

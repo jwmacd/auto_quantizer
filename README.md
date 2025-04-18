@@ -3,6 +3,36 @@
 
 Quantise any Hugging Face **text** model to efficient 4‑bit AWQ by simply pointing this container at a folder that holds the original *safetensors* weights.  When the container starts it automatically performs the quantisation and exits when finished – no shell access or bash commands required by the user.
 
+## High-Quality Mode
+
+For scenarios where maximum model fidelity is paramount, you can enable *High-Quality Mode* by adding `--max_quality` to the container arguments.  This mode:
+* Forces CPU-only quantization to avoid any GPU OOM issues.
+* Keeps key layers in FP16 (`--keep-fp-layers 0,1,-1`): embedding layer, first transformer block, and the LM head.
+* Enables descending activation order and zero-point adjustments (`--desc-act --zero-point`).
+* Uses an extended calibration pass (`--seq_len 16384 --calib-size 20000 --calib-split train,valid --dataset wikitext2,c4,book,github,stack`).
+* Performs a double-scale Hessian-based search (`--iter 40 --search-step 2`).
+* Dumps salient outlier columns in INT8 alongside the main 4‑bit tensors (`--dump-salient ./outlier.json --salient-quota 0.004`).
+* Writes the results into `/models/AWQ-4bit-MAX/` instead of the default `AWQ-4bit/`.
+
+## CLI Flags
+
+### General Options
+- `--model_path` (required): Path to your model directory.
+- `--seq_len` (default: 2048): Max sequence length for calibration (back-offs apply).
+- `--output_dir` (default: `<model_path>/AWQ-4bit`): Directory to write quantised files.
+- `--force_cpu`: Force entire quantisation on CPU.
+- `--max_quality`: Enable high-quality mode (see above).
+
+### Quality Knobs
+- `--keep-fp-layers`: Comma-separated layer indices to keep in FP16 (e.g. `0,1,-1`).
+- `--desc-act`: Use descending activation order for improved scale accuracy.
+- `--zero-point`: Enable zero-point quantisation for shifted ranges.
+- `--q-group-size`: Override the weight quantisation group size (default: 128).
+- `--iter`: Number of iterations for Hessian-based scale search (default: 1).
+- `--search-step`: Step multiplier for scale search (default: 1).
+- `--dump-salient`: Path to write salient outlier indices in JSON.
+- `--salient-quota`: Fraction of columns to treat as outliers (e.g. 0.004).
+
 ---
 
 ## How it works
